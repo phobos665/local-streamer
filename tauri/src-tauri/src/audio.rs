@@ -5,8 +5,13 @@
 //! Sources:
 //!   * game  - a capture device, e.g. "HDMI (Elgato 4K S)"
 //!   * music - loopback of an *output* device the user routes Spotify etc. to
-//!             (e.g. "Speakers (Steam Streaming Speakers)"), so it is heard once,
+//!             (e.g. "Speakers (Steam Streaming Speakers)" on Windows, or a
+//!             virtual device such as BlackHole on macOS), so it is heard once,
 //!             through us, rather than directly as well.
+//!
+//! Loopback is cpal's: WASAPI loopback on Windows, a Core Audio process tap on
+//! macOS (14.6+). Devices that are both input and output (BlackHole) are read
+//! as a plain input instead, which works on any macOS version.
 //!
 //! Each source has its own FIFO. Its fill level *is* that source's latency:
 //! we hold it near a target, dropping the oldest audio if it grows (clock
@@ -281,18 +286,31 @@ fn build(
             .and_then(|d| find(d, name))
             .ok_or_else(|| format!("Music device not found: {name}"))?;
         // Loopback: an input stream on an output device captures what plays to it.
-        let sup = dev.default_output_config().map_err(|e| e.to_string())?;
+        // A device that also has an input side (e.g. BlackHole on macOS) is
+        // opened as that input, so use its input format.
+        let sup = dev
+            .default_input_config()
+            .or_else(|_| dev.default_output_config())
+            .map_err(|e| e.to_string())?;
         let (s, r) = open_source(&dev, sup, Channel::Music, on_error.clone())?;
         parts.push(format!("music {} Hz", r.rate));
         streams.push(s);
         readers.push(r);
     }
 
-    // Play at the first source's rate in f32 stereo (WASAPI converts for us);
-    // fall back to the device's own format if that's refused.
-    let rate = readers[0].rate;
-    let wanted = StreamConfig { channels: 2, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
-    let out_stream = match output_stream::<f32>(&output, &wanted, take(&mut readers), shared.clone(), on_error.clone()) {
+    // Windows: play at the first source's rate in f32 stereo (WASAPI converts
+    // for us). Elsewhere, use the output device's own format: CoreAudio would
+    // otherwise switch the speakers' hardware sample rate system-wide to match
+    // the capture card. Our resampler covers any rate difference.
+    // Either way, fall back to the device's own format if the first try is refused.
+    let first_try = if cfg!(windows) {
+        let rate = readers[0].rate;
+        let wanted = StreamConfig { channels: 2, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
+        output_stream::<f32>(&output, &wanted, take(&mut readers), shared.clone(), on_error.clone())
+    } else {
+        Err((String::new(), take(&mut readers)))
+    };
+    let out_stream = match first_try {
         Ok(s) => s,
         Err((_, rs)) => {
             readers = rs;

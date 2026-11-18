@@ -1,6 +1,7 @@
-// Local Streamer - Tauri edition.
-// The webview (WebView2) captures the HDMI card via getUserMedia and plays it;
-// Rust provides global hotkeys, permission auto-grant and window-state persistence.
+// Local Streamer - Tauri edition (Windows and macOS).
+// The webview (WebView2 on Windows, WKWebView on macOS) captures the HDMI card
+// via getUserMedia and shows it; Rust plays the audio and provides global
+// hotkeys, permission auto-grant and window-state persistence.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod audio;
@@ -38,6 +39,10 @@ fn set_hotkeys(app: AppHandle, hotkeys: HashMap<String, String>) -> Vec<String> 
 /// Auto-allow camera/microphone requests from our own page so there's no
 /// prompt on every launch, and turn off browser shortcuts (F5 reload, Ctrl+F...).
 /// The page awaits this before calling getUserMedia.
+///
+/// Only Windows needs work here. On macOS, wry's WKUIDelegate grants the
+/// webview's media requests by default; the one-time system prompt (camera /
+/// microphone in Privacy & Security) comes from the Info.plist usage strings.
 #[tauri::command]
 async fn media_ready(window: WebviewWindow) -> Result<(), String> {
     #[cfg(windows)]
@@ -58,8 +63,21 @@ async fn media_ready(window: WebviewWindow) -> Result<(), String> {
             .await
             .map_err(|e| e.to_string())?;
     }
+    #[cfg(not(windows))]
+    let _ = window;
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// True when running on macOS outside an .app bundle (the bare binary from
+/// `npm run build`, or `npm run dev`). macOS reads the camera / microphone usage
+/// strings from the bundle's Info.plist, so outside a bundle it may block both.
+#[tauri::command]
+fn unbundled_mac() -> bool {
+    cfg!(target_os = "macos")
+        && !std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"))
+            .unwrap_or(true)
 }
 
 #[cfg(windows)]
@@ -90,8 +108,9 @@ unsafe fn install_permission_handler(pw: &tauri::webview::PlatformWebview) -> wi
 }
 
 // ------------------------------------------------------------------ audio
-// Audio is played from this process (not the WebView2 helper processes) so
-// Discord's window share captures it.
+// Audio is played from this process (not the webview's helper processes:
+// msedgewebview2.exe on Windows, WebKit's WebContent process on macOS) so
+// Discord's window share attributes it to this app.
 
 #[tauri::command]
 async fn audio_devices() -> audio::DeviceList {
@@ -155,6 +174,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             set_hotkeys,
             media_ready,
+            unbundled_mac,
             audio_devices,
             audio_configure,
             audio_set_volume,

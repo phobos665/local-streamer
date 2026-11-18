@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the app's Info.plist by the Tauri bundler (macOS only).
+     Without these strings macOS refuses camera / microphone access outright. -->
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Local Streamer shows your HDMI capture card's video, which macOS treats as a camera.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Local Streamer plays your capture card's audio, which macOS treats as a microphone.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Local Streamer can capture music playing to a spare output device and mix it into the stream.</string>
+</dict>
+</plist>

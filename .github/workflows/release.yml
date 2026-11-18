@@ -1,10 +1,11 @@
-# Builds the Tauri app's NSIS installer and attaches it to a GitHub release.
+# Builds the Tauri app for Windows (NSIS installer) and macOS (universal .dmg)
+# and attaches both to one GitHub release.
 #
 # To release: push a version tag, e.g.
 #   git tag v0.2.0
 #   git push origin v0.2.0
 # The tag's version (0.2.0) is written into tauri.conf.json before building,
-# so the installer and the app's version match the tag.
+# so the installers and the app's version match the tag.
 #
 # The release is created as a draft. Check it on GitHub, then press "Publish".
 
@@ -27,11 +28,66 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
 jobs:
-  build-windows:
-    runs-on: windows-latest
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
+  # One draft release up front, so the platform builds upload into the same
+  # release instead of racing to create it.
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.release_id }}
+    steps:
+      - name: Check tag
+        run: |
+          if ! [[ "${TAG#v}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a version like v1.2.3"
+            exit 1
+          fi
+
+      - name: Create draft release
+        id: create
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: |
+            Local Streamer ${{ env.TAG }}.
+
+            **Windows:** download `Local Streamer_*_x64-setup.exe` and run it.
+            Needs the WebView2 runtime (included with Windows 11; the installer fetches it if missing).
+
+            **macOS (12 or later, Apple Silicon and Intel):** download `Local Streamer_*_universal.dmg`
+            and drag the app to Applications. The app isn't notarized, so the first launch is blocked:
+            open System Settings → Privacy & Security and press "Open Anyway"
+            (or run `xattr -dr com.apple.quarantine "/Applications/Local Streamer.app"`).
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" \
+            -f target_commitish="$GITHUB_SHA" \
+            -f name="Local Streamer $TAG" \
+            -f body="$BODY" \
+            -F draft=true \
+            -F prerelease=false \
+            --jq .id)
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "Created draft release $id for $TAG"
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            rust_targets: ""
+            args: ""
+          - name: macos
+            os: macos-latest
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            args: --target universal-apple-darwin
+    name: build-${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: tauri
@@ -46,6 +102,8 @@ jobs:
           cache-dependency-path: tauri/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -55,10 +113,6 @@ jobs:
         shell: bash
         run: |
           VERSION="${TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
-            echo "::error::Tag '$TAG' is not a version like v1.2.3"
-            exit 1
-          fi
           node -e '
             const fs = require("fs");
             const p = "src-tauri/tauri.conf.json";
@@ -71,19 +125,12 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build installer and create release
+      - name: Build and upload to the release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: tauri
           tauriScript: npm run tauri
-          tagName: ${{ env.TAG }}
-          releaseName: Local Streamer ${{ env.TAG }}
-          releaseBody: |
-            Windows installer for Local Streamer ${{ env.TAG }}.
-
-            Download `Local Streamer_*_x64-setup.exe` below and run it.
-            Needs the WebView2 runtime (included with Windows 11; the installer fetches it if missing).
-          releaseDraft: true
-          prerelease: false
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}

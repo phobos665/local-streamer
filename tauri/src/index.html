@@ -86,10 +86,15 @@
     <section>
       <h2>Music</h2>
       <label>Capture from <select id="musicDevice"></select></label>
-      <p class="hint">Plays music (Spotify etc.) through this window so Discord picks it up, and you hear it once.
+      <p class="hint os-windows">Plays music (Spotify etc.) through this window so Discord picks it up, and you hear it once.
         One-time setup: Windows Settings → System → Sound → Volume mixer → set Spotify's
         <em>Output device</em> to a spare device you don't listen on (e.g. "Speakers (Steam Streaming Speakers)"),
         then choose that same device here.</p>
+      <p class="hint os-mac">Plays music (Spotify etc.) through this window so Discord picks it up, and you hear it once.
+        One-time setup: install a virtual audio device such as BlackHole 2ch and send the music player to it
+        (either make it the system output in System Settings → Sound and set Discord's own output to your speakers,
+        or route just the player with an app like SoundSource). Choose that device here, and set
+        <em>Output</em> above to your real speakers or headphones.</p>
       <div class="row">
         <span>Music volume</span>
         <output id="musicVolumeText">50%</output>
@@ -117,7 +122,7 @@
     <section>
       <h2>Window</h2>
       <label class="check"><input type="checkbox" id="onTop"> Always on top</label>
-      <button id="fullscreen">Fullscreen (F11 / double-click)</button>
+      <button id="fullscreen"><span class="os-windows">Fullscreen (F11 / double-click)</span><span class="os-mac">Full screen (⌃⌘F / double-click)</span></button>
     </section>
   </aside>
 

@@ -7,6 +7,8 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const appWindow = window.__TAURI__.window.getCurrentWindow();
 
+const IS_MAC = /Mac/.test(navigator.platform || navigator.userAgent);
+document.documentElement.classList.toggle("mac", IS_MAC); // shows the .os-mac hints
 const PREFERRED = "elgato 4k s";
 const VOLUME_STEP = 5;
 const MAX_VOLUME = 200;
@@ -74,6 +76,8 @@ function save() {
 let videoStream = null;
 let audioRunning = false;
 let devices = [];
+let cameraError = null; // why camera access failed, if it did (WebKit hides devices until granted)
+let unbundledMac = false; // macOS bare binary: no Info.plist, so camera/mic access is blocked
 let audioDevices = { inputs: [], outputs: [], default_output: null };
 
 // ---------------------------------------------------------------- UI helpers
@@ -108,10 +112,15 @@ async function refreshDevices() {
   devices = await navigator.mediaDevices.enumerateDevices();
   if (devices.some((d) => d.kind === "videoinput" && !d.label)) {
     // Labels are hidden until camera permission is used once this session.
+    // WebKit (macOS) goes further and lists one placeholder camera with no id,
+    // so if this fails there is nothing usable to open: remember why.
     try {
       const s = await navigator.mediaDevices.getUserMedia({ video: true });
       s.getTracks().forEach((t) => t.stop());
-    } catch {}
+      cameraError = null;
+    } catch (e) {
+      cameraError = e;
+    }
     devices = await navigator.mediaDevices.enumerateDevices();
   }
   const cams = devices.filter((d) => d.kind === "videoinput");
@@ -149,10 +158,26 @@ function parseMode(m) {
   return { width: +w, height: +h, frameRate: +f };
 }
 
+const UNBUNDLED_TEXT =
+  "macOS blocks camera and microphone access when Local Streamer runs as a bare binary.\n" +
+  "Open Local Streamer.app instead (npm run build:mac puts it in src-tauri/target/release/bundle/macos/).";
+
+function videoErrorText(e) {
+  if (e.name === "NotReadableError")
+    return "Can't open the capture card.\nAnother app (OBS, Elgato Studio, the Python version...) is probably using it.";
+  if (e.name === "NotAllowedError" && unbundledMac) return UNBUNDLED_TEXT;
+  if (e.name === "NotAllowedError" && IS_MAC)
+    return "Camera access is off for Local Streamer.\nTurn it on in System Settings → Privacy & Security → Camera, then reopen the app.";
+  return `Video error: ${e.name}\n${e.message}`;
+}
+
 async function startVideo(deviceId) {
   stopStream(videoStream);
   videoStream = null;
-  if (!deviceId) { message("No video device found.\nPlug in the capture card."); return; }
+  if (!deviceId) {
+    message(cameraError ? videoErrorText(cameraError) : "No video device found.\nPlug in the capture card.");
+    return;
+  }
   const mode = parseMode(settings.mode);
   try {
     videoStream = await navigator.mediaDevices.getUserMedia({
@@ -166,9 +191,7 @@ async function startVideo(deviceId) {
       },
     });
   } catch (e) {
-    message(e.name === "NotReadableError"
-      ? "Can't open the capture card.\nAnother app (OBS, Elgato Studio, the Python version...) is probably using it."
-      : `Video error: ${e.name}\n${e.message}`);
+    message(videoErrorText(e));
     return;
   }
   message("");
@@ -239,6 +262,8 @@ async function startAudio() {
     const desc = await invoke("audio_configure", { game, music, output });
     audioRunning = !!(game || music);
     els.audioStatus.textContent = audioRunning ? `Playing ${desc}` : "Audio off";
+    if (audioRunning && unbundledMac)
+      els.audioStatus.textContent += ". Running outside Local Streamer.app, so macOS may give silence: open the .app instead.";
   } catch (e) {
     audioRunning = false;
     els.audioStatus.textContent = `Audio error: ${e}`;
@@ -295,8 +320,16 @@ function stopStream(s) { s?.getTracks().forEach((t) => t.stop()); }
 
 // ---------------------------------------------------------------- hotkeys
 const hotkeyButtons = [...document.querySelectorAll(".hotkey")];
-const prettyKey = (accel) =>
-  accel ? accel.replace(/Key([A-Z])/, "$1").replace(/Digit(\d)/, "$1").replace(/Arrow/, "") : "(none)";
+const MAC_SYMBOLS = { Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Super: "⌘" };
+const prettyKey = (accel) => {
+  if (!accel) return "(none)";
+  const text = accel.replace(/Key([A-Z])/, "$1").replace(/Digit(\d)/, "$1").replace(/Arrow/, "");
+  if (!IS_MAC) return text;
+  // macOS style: ⌃⌥Up rather than Ctrl+Alt+Up.
+  const parts = text.split("+");
+  const key = parts.pop();
+  return parts.map((m) => MAC_SYMBOLS[m] ?? `${m}+`).join("") + key;
+};
 
 async function registerHotkeys() {
   const failed = await invoke("set_hotkeys", { hotkeys: settings.hotkeys });
@@ -336,7 +369,7 @@ function captureKey(e) {
   if (MODIFIER_CODES.test(e.code)) return;
   const mods = [e.ctrlKey && "Ctrl", e.altKey && "Alt", e.shiftKey && "Shift", e.metaKey && "Super"].filter(Boolean);
   if (!mods.length && !/^F\d+$/.test(e.code)) {
-    capturing.textContent = "Add Ctrl / Alt / Shift";
+    capturing.textContent = IS_MAC ? "Add ⌃ / ⌥ / ⇧ / ⌘" : "Add Ctrl / Alt / Shift";
     return;
   }
   finishCapture([...mods, e.code].join("+"));
@@ -473,11 +506,17 @@ function wire() {
   });
   document.addEventListener("keydown", (e) => {
     if (capturing) return captureKey(e);
-    if (e.code === "F11") { e.preventDefault(); toggleFullscreen(); }
-    else if (e.code === "Escape") {
+    // macOS: Ctrl+Cmd+F is the usual full-screen key (F11 shows the desktop) and Cmd+, opens settings.
+    if (e.code === "F11" || (IS_MAC && e.ctrlKey && e.metaKey && e.code === "KeyF")) {
+      e.preventDefault();
+      toggleFullscreen();
+    } else if (e.code === "Escape") {
       if (!els.panel.hidden) togglePanel(false);
       else appWindow.setFullscreen(false);
-    } else if (e.ctrlKey && e.code === "KeyH") { e.preventDefault(); togglePanel(); }
+    } else if ((e.ctrlKey && e.code === "KeyH") || (IS_MAC && e.metaKey && e.code === "Comma")) {
+      e.preventDefault();
+      togglePanel();
+    }
   });
   document.addEventListener("pointermove", poke);
   poke();
@@ -499,6 +538,7 @@ function wire() {
 }
 
 async function main() {
+  if (IS_MAC) els.gear.title = "Settings (right-click, Ctrl+H or ⌘,)";
   wire();
   applyLevel("game", false);
   applyLevel("music", false);
@@ -519,6 +559,7 @@ async function main() {
 
   message("Starting capture...");
   try { await invoke("media_ready"); } catch (e) { console.warn("media_ready", e); }
+  if (IS_MAC) unbundledMac = await invoke("unbundled_mac").catch(() => false);
   const { cam } = await refreshDevices();
   await Promise.all([startVideo(cam?.deviceId), startAudio()]);
 }
