@@ -1,0 +1,89 @@
+# Builds the Tauri app's NSIS installer and attaches it to a GitHub release.
+#
+# To release: push a version tag, e.g.
+#   git tag v0.2.0
+#   git push origin v0.2.0
+# The tag's version (0.2.0) is written into tauri.conf.json before building,
+# so the installer and the app's version match the tag.
+#
+# The release is created as a draft. Check it on GitHub, then press "Publish".
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.2.0 (created on the selected branch if it doesn't exist)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    defaults:
+      run:
+        working-directory: tauri
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tauri/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri/src-tauri -> target
+
+      - name: Set app version from tag
+        shell: bash
+        run: |
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
+            echo "::error::Tag '$TAG' is not a version like v1.2.3"
+            exit 1
+          fi
+          node -e '
+            const fs = require("fs");
+            const p = "src-tauri/tauri.conf.json";
+            const c = JSON.parse(fs.readFileSync(p, "utf8"));
+            c.version = process.argv[1];
+            fs.writeFileSync(p, JSON.stringify(c, null, 2) + "\n");
+          ' "$VERSION"
+          echo "Building version $VERSION"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build installer and create release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: tauri
+          tauriScript: npm run tauri
+          tagName: ${{ env.TAG }}
+          releaseName: Local Streamer ${{ env.TAG }}
+          releaseBody: |
+            Windows installer for Local Streamer ${{ env.TAG }}.
+
+            Download `Local Streamer_*_x64-setup.exe` below and run it.
+            Needs the WebView2 runtime (included with Windows 11; the installer fetches it if missing).
+          releaseDraft: true
+          prerelease: false
