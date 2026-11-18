@@ -164,7 +164,7 @@ const UNBUNDLED_TEXT =
 
 function videoErrorText(e) {
   if (e.name === "NotReadableError")
-    return "Can't open the capture card.\nAnother app (OBS, Elgato Studio, the Python version...) is probably using it.";
+    return "Can't open the capture card.\nAnother app (OBS, Elgato Studio...) is probably using it.";
   if (e.name === "NotAllowedError" && unbundledMac) return UNBUNDLED_TEXT;
   if (e.name === "NotAllowedError" && IS_MAC)
     return "Camera access is off for Local Streamer.\nTurn it on in System Settings → Privacy & Security → Camera, then reopen the app.";

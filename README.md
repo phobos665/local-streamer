@@ -16,7 +16,6 @@ you set under *Now playing*). The game's sound plays from the app itself, so it 
 - [Troubleshooting](#troubleshooting)
 - [Building from source](#building-from-source)
 - [How it works](#how-it-works)
-- [Python version (Windows only)](#python-version-windows-only)
 - [Licence](#licence)
 
 ## Install
@@ -47,8 +46,8 @@ The app is ad-hoc signed, so macOS may ask for these permissions again after you
 
 ## Using it
 
-Only one app can use the capture card at a time. Close OBS, the Elgato software, or the
-Python version before starting Local Streamer.
+Only one app can use the capture card at a time. Close OBS or the Elgato software before
+starting Local Streamer.
 
 | What | Windows | macOS |
 | --- | --- | --- |
@@ -114,7 +113,7 @@ desktop app must be running.
 
 | Problem | Fix |
 | --- | --- |
-| "Can't open the capture card" | Another app has it open. Close OBS, Elgato Studio / 4K Capture Utility, or the Python version. |
+| "Can't open the capture card" | Another app has it open. Close OBS or Elgato Studio / 4K Capture Utility. |
 | macOS: no video or audio devices, or "macOS blocks camera and microphone access…" | You're running the bare binary (`target/release/local-streamer`) instead of the app. Open `Local Streamer.app`. macOS only grants camera and microphone access to a bundled app. |
 | macOS: "Camera access is off" | System Settings → Privacy & Security → Camera → turn on Local Streamer, then reopen the app. |
 | No video devices listed | Replug the card. On macOS, check that Local Streamer has Camera access. |
@@ -176,26 +175,6 @@ The app version is taken from the tag.
   windows during a Discord share.
 
 See [tauri/README.md](tauri/README.md) for more developer detail.
-
-## Python version (Windows only)
-
-The repo root also has an older Python + PySide6 version (`local_streamer.py`) with fewer
-features. It uses Win32 APIs for its global hotkeys, so it only runs on Windows.
-
-Double-click `run.bat`. The first run creates `.venv` and installs PySide6; after that it starts
-the app straight away. Or run it by hand:
-
-```sh
-python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python local_streamer.py
-```
-
-| What | How |
-| --- | --- |
-| Menu | Right-click anywhere, or Ctrl+H to show the menu bar |
-| Volume (global) | Ctrl+Alt+Up / Ctrl+Alt+Down / Ctrl+Alt+M, changeable under Audio → Hotkeys... |
-| Fullscreen | F11 or double-click. Esc to leave. |
 
 ## Requirements
 

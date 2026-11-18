@@ -17,7 +17,6 @@ plays its audio from its own process, so a console game can be screen-shared to 
 | `tauri/src-tauri/tauri.macos.conf.json` | macOS overrides, merged automatically on macOS: `.app` + `.dmg`, ad-hoc signing, entitlements. |
 | `tauri/src-tauri/Info.plist` | Merged into the macOS bundle. Camera / microphone / audio-capture usage strings. |
 | `tauri/src-tauri/Entitlements.plist` | Camera + audio-input entitlements for the hardened runtime. |
-| `local_streamer.py`, `run.bat` | Legacy Python/PySide6 version. **Windows only** (Win32 `RegisterHotKey` via ctypes). Don't port it; new features go in `tauri/`. |
 | `.github/workflows/release.yml` | Tag `v*` -> draft release with the Windows NSIS installer and a macOS universal `.dmg`. |
 
 ## Commands
@@ -92,7 +91,7 @@ There is no JS test suite or linter config. Keep the front end dependency-free.
   (values are UTF-16). Useful for checking what the app selected.
 - The macOS build is ad-hoc signed (`signingIdentity: "-"`), not notarized. Each rebuild has a new
   signature, so macOS may ask for camera/mic permission again after an update.
-- Only one app can open a UVC capture card at a time (OBS, Elgato software, the Python version).
+- Only one app can open a UVC capture card at a time (OBS, Elgato software).
 
 ## Conventions
 
