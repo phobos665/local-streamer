@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Streamer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <video id="video" autoplay muted playsinline disablepictureinpicture></video>
+  <canvas id="fsr" hidden></canvas>
+
+  <div id="message" hidden></div>
+  <div id="osd" hidden></div>
+
+  <button id="gear" class="chrome" title="Settings (right-click or Ctrl+H)" aria-label="Settings">
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L15 3.5h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2.1-1.6ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" transform="translate(-1 0)"/></svg>
+  </button>
+
+  <aside id="panel" hidden>
+    <header>
+      <h1>Local Streamer</h1>
+      <button id="close" class="icon" aria-label="Close settings">&times;</button>
+    </header>
+
+    <section>
+      <h2>Now playing</h2>
+      <label>Game <input id="game" type="text" list="gameHistory" placeholder="e.g. Need for Speed: Most Wanted" autocomplete="off"></label>
+      <label>Console <input id="console" type="text" list="consoleList" placeholder="e.g. Xbox 360" autocomplete="off"></label>
+      <datalist id="gameHistory"></datalist>
+      <datalist id="consoleList"></datalist>
+      <p class="hint">Sets the window title, which is the name Discord shows when you pick the window to share.</p>
+      <details>
+        <summary>Discord status (Rich Presence)</summary>
+        <p class="hint">Shows "Playing &lt;game&gt;" and "on &lt;console&gt;" on your Discord profile.
+          One-time setup: go to discord.com/developers/applications, click New Application, name it
+          (e.g. "Console"), then paste its Application ID below.</p>
+        <label>Application ID <input id="discordId" type="text" inputmode="numeric" placeholder="Leave empty to turn off" autocomplete="off"></label>
+        <p id="presenceStatus" class="hint"></p>
+      </details>
+    </section>
+
+    <section>
+      <h2>Video</h2>
+      <label>Source <select id="videoDevice"></select></label>
+      <label>Resolution / frame rate <select id="videoMode"></select></label>
+      <p id="videoStatus" class="hint"></p>
+      <label>Scaling
+        <select id="scaling">
+          <option value="off">Standard (smooth)</option>
+          <option value="fsr">AMD FSR 1 (sharper upscaling)</option>
+        </select>
+      </label>
+      <div id="sharpnessRow">
+        <div class="row">
+          <span>Sharpness</span>
+          <output id="sharpnessText">80%</output>
+        </div>
+        <input id="sharpness" type="range" min="0" max="100" step="5" value="80" aria-label="Sharpness">
+        <p id="fsrStatus" class="hint"></p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Audio</h2>
+      <label>Input (capture audio) <select id="audioDevice"></select></label>
+      <label>Output (play through) <select id="audioOutput"></select></label>
+      <p id="audioStatus" class="hint"></p>
+      <div class="row">
+        <span>Volume</span>
+        <output id="volumeText">80%</output>
+      </div>
+      <div class="row">
+        <input id="volume" type="range" min="0" max="200" step="1" value="80" aria-label="Volume">
+        <button id="mute" class="toggle" aria-pressed="false">Mute</button>
+      </div>
+      <p class="hint">Over 100% boosts the signal.</p>
+      <div class="row">
+        <span>Audio delay</span>
+        <output id="delayText">0 ms</output>
+      </div>
+      <input id="delay" type="range" min="0" max="500" step="10" value="0" aria-label="Audio delay">
+      <p class="hint">Add delay if sound arrives before the picture.</p>
+    </section>
+
+    <section>
+      <h2>Music</h2>
+      <label>Capture from <select id="musicDevice"></select></label>
+      <p class="hint">Plays music (Spotify etc.) through this window so Discord picks it up, and you hear it once.
+        One-time setup: Windows Settings → System → Sound → Volume mixer → set Spotify's
+        <em>Output device</em> to a spare device you don't listen on (e.g. "Speakers (Steam Streaming Speakers)"),
+        then choose that same device here.</p>
+      <div class="row">
+        <span>Music volume</span>
+        <output id="musicVolumeText">50%</output>
+      </div>
+      <div class="row">
+        <input id="musicVolume" type="range" min="0" max="200" step="1" value="50" aria-label="Music volume">
+        <button id="musicMute" class="toggle" aria-pressed="false">Mute</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Global hotkeys</h2>
+      <p class="hint">Work while other windows are focused. Click, then press a combination. Esc cancels, Backspace clears.</p>
+      <div class="hotkeys">
+        <span>Volume up</span><button class="hotkey" data-action="volume_up"></button>
+        <span>Volume down</span><button class="hotkey" data-action="volume_down"></button>
+        <span>Mute / unmute</span><button class="hotkey" data-action="mute"></button>
+        <span>Music up</span><button class="hotkey" data-action="music_up"></button>
+        <span>Music down</span><button class="hotkey" data-action="music_down"></button>
+        <span>Music mute</span><button class="hotkey" data-action="music_mute"></button>
+      </div>
+      <button id="resetHotkeys" class="link">Restore defaults</button>
+    </section>
+
+    <section>
+      <h2>Window</h2>
+      <label class="check"><input type="checkbox" id="onTop"> Always on top</label>
+      <button id="fullscreen">Fullscreen (F11 / double-click)</button>
+    </section>
+  </aside>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
