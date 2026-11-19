@@ -34,13 +34,30 @@ bare binary gets no video and silent audio. The app detects this and says so.
 ## How it works
 
 - `src/` is plain HTML/CSS/JS with no bundler. `getUserMedia` opens the capture card and
-  the picture goes to a `<video>` element, or through `src/fsr.js` (WebGL FSR 1) to a canvas.
+  the picture goes to a `<video>` element. Crop, a forced aspect ratio, sharp / integer scaling
+  and FSR 1 go through the WebGL renderer in `src/fsr.js` instead, drawing to a canvas.
+  `main.js` gives it a layout function (which part of the frame, and where on the canvas, in
+  device pixels) and a filter (`linear`, `nearest` or `fsr`).
+- `src/analyse.js` works on luma arrays with no DOM: `findPicture` finds the black borders and a
+  line multiplier (rows repeated in blocks of *f*, so all row-to-row change sits on every *f*-th
+  row; the largest *f* that fits wins), and `flashFraction` drives the A/V sync helper.
+- Stats overlay: frame rate and capture-to-screen latency come from
+  `requestVideoFrameCallback`, dropped frames from `getVideoPlaybackQuality()` and the track's
+  `stats`. Audio numbers come from the `audio_stats` command, which reads atomics that the
+  audio callbacks keep up to date: FIFO fill vs target, underruns, skips, peaks, output buffer,
+  device latency and clipped samples.
+- A/V sync helper: `audio_sync_probe` turns on a beep detector on the game source in the output
+  callback. It timestamps each beep at the moment it leaves the output device (callback time
+  plus cpal's playback timestamp), on the engine's monotonic clock (`audio_clock`). The page
+  times flashes with `requestVideoFrameCallback`'s `expectedDisplayTime`, converts beep times
+  with a round-trip clock offset, pairs flashes with beeps, and sets the delay from the median.
 - Sound does **not** go through the webview. WebView2 plays audio from its own helper process
   (msedgewebview2.exe) and WKWebView from WebKit's WebContent process, and Discord's window share
   doesn't attribute those to the app. `src-tauri/src/audio.rs` instead captures the input with
   cpal (WASAPI on Windows, Core Audio on macOS) and plays it from the app's own process.
   The buffer is held at 15 ms plus the audio delay setting. If clock drift lets the buffer grow,
-  it skips ahead; if it runs dry, it refills with silence.
+  it skips ahead; if it runs dry, it refills with silence. When the delay setting changes, the
+  buffer moves to the new level at once: it trims, or refills with silence.
 - Music mix-in captures an output device: WASAPI loopback on Windows, a Core Audio process tap on
   macOS 14.6+. A virtual device with an input side, such as BlackHole, is read as an ordinary input.
 - On macOS the output stream uses the device's own sample rate and format, because cpal would

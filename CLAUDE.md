@@ -9,7 +9,7 @@ plays its audio from its own process, so a console game can be screen-shared to 
 | Path | What |
 | --- | --- |
 | `tauri/` | **Main app.** Tauri 2 + Rust back end, plain HTML/CSS/JS front end (no bundler, no framework). |
-| `tauri/src/` | Front end. `main.js` (all UI logic and settings), `fsr.js` (WebGL AMD FSR 1), `index.html`, `style.css`. |
+| `tauri/src/` | Front end. `main.js` (all UI logic and settings), `fsr.js` (WebGL renderer: crop, aspect, nearest / integer scaling, AMD FSR 1), `analyse.js` (frame analysis: borders, line multiplier, flash detection; no DOM), `index.html`, `style.css`. |
 | `tauri/src-tauri/src/main.rs` | Tauri commands, global hotkeys, Windows-only WebView2 permission handler. |
 | `tauri/src-tauri/src/audio.rs` | cpal audio engine: game input + optional music loopback, mixed and played to an output device. |
 | `tauri/src-tauri/src/discord.rs` | Optional Discord Rich Presence over local IPC. |
@@ -41,10 +41,14 @@ cargo test -- --ignored    # hardware test, Windows only (expects "Steam Streami
 ```
 
 There is no JS test suite or linter config. Keep the front end dependency-free.
+`cargo test engine_tests` covers the audio FIFO and beep detector without audio hardware.
 
 ## How it fits together
 
-- **Video**: `getUserMedia` in the webview -> `<video>` (or the FSR canvas). The page calls the
+- **Video**: `getUserMedia` in the webview -> `<video>`, or the WebGL canvas (`fsr.js`) whenever
+  crop, aspect, sharp / integer scaling or FSR is on. `layout()` in `main.js` decides the crop and
+  output rectangle in device pixels; integer scaling uses whole screen pixels per *source* line
+  (capture lines / `lineMultiplier`). The page calls the
   `media_ready` command before `getUserMedia`. On Windows that installs a WebView2
   `PermissionRequested` handler that auto-allows camera/mic and disables browser accelerator keys.
   On macOS it's a no-op: wry's WKUIDelegate grants media requests by default, and the OS-level
@@ -56,7 +60,10 @@ There is no JS test suite or linter config. Keep the front end dependency-free.
 - **Audio engine** (`audio.rs`): a dedicated thread owns the cpal streams (they aren't `Send`
   on every host). Each source has a FIFO whose fill level is its latency, held near a target
   (15 ms game + user delay, 30 ms music); overshoot beyond 50 ms is dropped, underrun re-primes
-  with silence. Linear resampling handles rate differences between sources and the output.
+  with silence, and a target change (delay slider) trims or re-primes at once. Linear resampling
+  handles rate differences between sources and the output. Callbacks also keep atomics for the
+  stats overlay (`audio_stats`) and, while `audio_sync_probe` is on, timestamp beep onsets on the
+  engine clock (`audio_clock`) for the A/V sync helper.
 - **Music loopback**: an input stream on an *output* device. cpal does this with WASAPI loopback
   on Windows and a Core Audio process tap on macOS 14.6+. Devices with an input side (BlackHole)
   are opened as a plain input, so the code prefers `default_input_config()` and falls back to
@@ -68,7 +75,9 @@ There is no JS test suite or linter config. Keep the front end dependency-free.
   `set_hotkeys`; Rust emits `hotkey` events back. Accelerators use `KeyboardEvent.code` names
   (`Ctrl+Alt+ArrowUp`); `Super` is Cmd on macOS. macOS shows them with ⌃⌥⇧⌘ (`prettyKey`).
 - **Settings** live in the webview's `localStorage` (`settings` key). Devices are remembered
-  by label, not id. Window position/size: `tauri-plugin-window-state`.
+  by label, not id. Crop is stored with the frame size it was set on and scaled if the mode changes.
+- **Discord presence** sends the game as the activity `name` (some Discord builds show it in place
+  of the application name) and also in `details` with `StatusDisplayType::Details`. Window position/size: `tauri-plugin-window-state`.
 - **Background throttling** must stay off, or video freezes while the window is behind Discord:
   `additionalBrowserArgs` (WebView2) and `backgroundThrottling: "disabled"` (WKWebView, macOS 14+).
 

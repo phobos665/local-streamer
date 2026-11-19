@@ -2,6 +2,7 @@
 
 Ideas for where Local Streamer could go next. Nothing here is committed to; it's a backlog to pick
 from. Effort is a rough guess: **S** about an afternoon, **M** a few days, **L** a week or more.
+Items marked **Done** have shipped and are kept for context.
 
 ## Contents
 
@@ -157,7 +158,7 @@ Plan: ship A, grow it into B.
 | **Screenshot hotkey** | Draw the frame (or FSR / CRT canvas) to a canvas; save PNG and/or copy to clipboard. | S |
 | **Privacy / BRB screen** | Hotkey shows a "Be right back" card and mutes game audio; music keeps playing. For password entry or stepping away. | S |
 | **Output limiter** | Volume goes to 200% and probably clips. Soft-knee or look-ahead limiter in `audio.rs`. | S |
-| **Audio level meters** | Rust emits game / music peaks a few times a second; meters in the panel. | S |
+| **Audio level meters** | Peaks are already in `audio_stats` (stats overlay); meters in the panel would reuse them. | S |
 | **Hot-plug and reconnect** | Restart video and audio on `devicechange`; "No signal" overlay instead of a frozen frame. | S–M |
 
 ## Picture
@@ -165,8 +166,8 @@ Plan: ship A, grow it into B.
 | Idea | Notes | Effort |
 | --- | --- | --- |
 | **RGB range fix** (limited ↔ full) | Common cause of washed-out or crushed blacks. A shader tweak. | S |
-| **Crop / overscan / aspect presets** | 4:3, trim bars, stretch vs fit. Shares the active-area logic with the CRT filter. | S–M |
-| **Integer / nearest-neighbour scaling** | For pixel art where FSR blurs. | S |
+| **Crop / overscan / aspect presets** | **Done.** 4:3 / 16:9 / stretch, crop, overscan, and *Detect* (black bars + line multiplier). The CRT filter can reuse `cropRect` and the line multiplier. | S–M |
+| **Integer / nearest-neighbour scaling** | **Done.** *Sharp pixels* and *Integer scale* (whole screen pixels per source line). | S |
 | **Brightness / contrast / saturation** | | S |
 
 ## Per-game and per-console profiles
@@ -180,7 +181,8 @@ CRT preset and 40 ms delay in one go. **M**
 | Idea | Notes | Effort |
 | --- | --- | --- |
 | **Cover art in Rich Presence** | `large_image` accepts external URLs. User-supplied URL, or an IGDB lookup. | S–M |
-| **Elapsed-time timestamp** | If not already sent. | S |
+| **Elapsed-time timestamp** | Already sent. | S |
+| **Game as the activity name** | **Done.** Sent as `name`; Discord builds that ignore it still show the game under the app name. | S |
 | **Playtime log** | Per-game session history. | S–M |
 
 ## Overlays
@@ -193,9 +195,10 @@ These appear in the share.
 
 ## Diagnostics
 
-- **Stats overlay**: FPS and dropped frames (`requestVideoFrameCallback`), actual capture mode,
-  audio FIFO fill and underruns from Rust. **S–M**
-- **A/V sync helper**: flash-and-beep test pattern to tune *Audio delay*. **M**
+- **Stats overlay**: **Done.** FPS, dropped frames, capture-to-screen latency, actual capture mode,
+  audio FIFO fill / target, underruns, skips, peaks, output latency and clipping. Ctrl+I.
+- **A/V sync helper**: **Done.** Times a flash-and-beep test played on the console and sets
+  *Audio delay*. Also fixed the delay slider, which only took effect after the next dropout.
 
 ## Distribution and polish
 

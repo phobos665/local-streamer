@@ -50,7 +50,14 @@ impl Presence {
                                 client = Some((client_id, c));
                             }
                             let (_, c) = client.as_mut().unwrap();
+                            // Without `name`, Discord's profile card reads "Playing <application
+                            // name>" (whatever the user called the app in the developer portal).
+                            // Recent Discord builds take `name` as an override, so the card reads
+                            // "Playing <game>". Builds that ignore it still show the game in the
+                            // member list, through `details` + StatusDisplayType::Details.
+                            let title = if game.is_empty() { &console } else { &game };
                             let mut act = Activity::new()
+                                .name(title.as_str())
                                 .activity_type(ActivityType::Playing)
                                 .status_display_type(StatusDisplayType::Details)
                                 .timestamps(Timestamps::new().start(start_ms));

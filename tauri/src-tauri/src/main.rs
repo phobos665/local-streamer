@@ -140,6 +140,27 @@ fn audio_set_delay(engine: State<'_, audio::AudioEngine>, ms: u32) {
     engine.set_delay(ms);
 }
 
+#[tauri::command]
+fn audio_stats(engine: State<'_, audio::AudioEngine>) -> audio::StatsSnapshot {
+    engine.stats()
+}
+
+/// The audio engine's clock, so the page can line beep times up with frame times.
+#[tauri::command]
+fn audio_clock(engine: State<'_, audio::AudioEngine>) -> f64 {
+    engine.clock_ms()
+}
+
+#[tauri::command]
+fn audio_sync_probe(engine: State<'_, audio::AudioEngine>, on: bool) {
+    engine.sync_probe(on);
+}
+
+#[tauri::command]
+fn audio_sync_onsets(engine: State<'_, audio::AudioEngine>) -> Vec<f64> {
+    engine.sync_onsets()
+}
+
 // ------------------------------------------------------------------ discord
 #[tauri::command]
 fn presence_set(
@@ -179,6 +200,10 @@ fn main() {
             audio_configure,
             audio_set_volume,
             audio_set_delay,
+            audio_stats,
+            audio_clock,
+            audio_sync_probe,
+            audio_sync_onsets,
             presence_set
         ])
         .run(tauri::generate_context!())

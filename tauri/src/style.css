@@ -32,7 +32,7 @@ body.idle, body.idle * { cursor: none !important; }
   background: #000;
 }
 
-#fsr {
+#canvas {
   position: fixed;
   inset: 0;
   width: 100%;
@@ -47,6 +47,20 @@ body.idle, body.idle * { cursor: none !important; }
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.7);
   font-size: 20px;
+  pointer-events: none;
+}
+
+#stats {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  margin: 0;
+  max-width: calc(100% - 24px);
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.72);
+  font: 12px/1.45 Consolas, Menlo, monospace;
+  white-space: pre-wrap;
   pointer-events: none;
 }
 
@@ -118,7 +132,7 @@ select, button {
   padding: 6px 10px;
 }
 select { display: block; width: 100%; margin-top: 4px; }
-input[type="text"] {
+input[type="text"], input[type="number"] {
   display: block;
   width: 100%;
   margin-top: 4px;
@@ -153,4 +167,9 @@ html.mac .os-windows, html:not(.mac) .os-mac { display: none; }
 .hotkey.listening { border-color: var(--accent); color: var(--accent); }
 .hotkey.failed { border-color: #c45; }
 
-#fullscreen { width: 100%; margin-top: 8px; }
+#fullscreen, button.wide { width: 100%; margin-top: 8px; }
+
+.crop { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0 8px; margin-bottom: 4px; }
+.crop > span { grid-column: 1 / -1; color: var(--muted); margin-bottom: 4px; }
+.crop label { margin-bottom: 8px; font-size: 12px; }
+.crop input { padding: 4px 6px; }

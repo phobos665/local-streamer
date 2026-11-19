@@ -1,7 +1,8 @@
 // Local Streamer frontend. Picture: getUserMedia -> <video>.
 // Sound: handled in Rust (src-tauri/src/audio.rs) so it plays from the app's own
 // process, which is what Discord's window share captures.
-import { FsrRenderer } from "./fsr.js";
+import { VideoRenderer } from "./fsr.js";
+import { lumaOf, findPicture, flashFraction } from "./analyse.js";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -39,8 +40,14 @@ const els = {
   delay: $("delay"), delayText: $("delayText"),
   musicDevice: $("musicDevice"), musicVolume: $("musicVolume"), musicVolumeText: $("musicVolumeText"),
   musicMute: $("musicMute"),
-  fsrCanvas: $("fsr"), scaling: $("scaling"), sharpness: $("sharpness"), sharpnessText: $("sharpnessText"),
-  sharpnessRow: $("sharpnessRow"), fsrStatus: $("fsrStatus"),
+  canvas: $("canvas"), scaling: $("scaling"), sharpness: $("sharpness"), sharpnessText: $("sharpnessText"),
+  sharpnessRow: $("sharpnessRow"), pictureStatus: $("pictureStatus"),
+  aspect: $("aspect"), overscan: $("overscan"), overscanText: $("overscanText"),
+  lineMultiplier: $("lineMultiplier"), lineMultiplierRow: $("lineMultiplierRow"),
+  detect: $("detect"), resetCrop: $("resetCrop"),
+  crop: { top: $("cropTop"), bottom: $("cropBottom"), left: $("cropLeft"), right: $("cropRight") },
+  stats: $("stats"), showStats: $("showStats"),
+  measureSync: $("measureSync"), syncStatus: $("syncStatus"),
   resetHotkeys: $("resetHotkeys"), onTop: $("onTop"), fullscreen: $("fullscreen"),
   game: $("game"), console: $("console"), gameHistory: $("gameHistory"), consoleList: $("consoleList"),
   discordId: $("discordId"), presenceStatus: $("presenceStatus"),
@@ -60,6 +67,10 @@ const settings = Object.assign(
     game: "", console: "", gameHistory: [], consoleHistory: [], discordId: "", playStart: 0,
     musicLabel: "", musicVolume: 50, musicMuted: false,
     scaling: "off", sharpness: 80,
+    // Picture. crop holds border sizes in pixels of a w x h frame (scaled if the mode changes).
+    aspect: "source", overscan: 0, lineMultiplier: 1,
+    crop: { top: 0, bottom: 0, left: 0, right: 0, w: 0, h: 0 },
+    showStats: false,
   },
   load(),
 );
@@ -202,7 +213,8 @@ async function startVideo(deviceId) {
   });
   els.video.srcObject = videoStream;
   els.video.play().catch(() => {});
-  if (settings.scaling === "fsr") fsr?.setEnabled(true); // re-arm frame callbacks for the new source
+  if (renderer?.enabled) renderer.setEnabled(true); // re-arm frame callbacks for the new source
+  if (stats.on) startStats();
   settings.videoLabel = track.label;
   save();
   updateTitle();
@@ -228,25 +240,140 @@ function updateModes(track) {
       ? " (device picked the closest mode)" : "");
 }
 
-// ---------------------------------------------------------------- scaling (FSR 1)
-let fsr = null;
-function applyScaling() {
-  if (settings.scaling === "fsr" && !fsr) {
+// ---------------------------------------------------------------- picture
+// The plain <video> element shows the whole frame, fitted. Anything else (crop,
+// aspect, sharp / integer scaling, FSR) goes through the WebGL renderer.
+const ASPECTS = { "4:3": 4 / 3, "16:9": 16 / 9 };
+const FILTERS = { off: "linear", sharp: "nearest", integer: "nearest", fsr: "fsr" };
+const CROP_SIDES = ["top", "bottom", "left", "right"];
+let renderer = null;
+
+/** Border sizes for a vw x vh frame, scaled from the frame size they were set on. */
+function cropBorders(vw, vh) {
+  const c = settings.crop;
+  const sx = c.w ? vw / c.w : 1;
+  const sy = c.h ? vh / c.h : 1;
+  return {
+    top: Math.round(c.top * sy), bottom: Math.round(c.bottom * sy),
+    left: Math.round(c.left * sx), right: Math.round(c.right * sx),
+  };
+}
+
+/** The part of the frame to show: crop, then overscan (in whole source lines). */
+function cropRect(vw, vh) {
+  const b = cropBorders(vw, vh);
+  let x = b.left, y = b.top, w = vw - b.left - b.right, h = vh - b.top - b.bottom;
+  if (w < 16 || h < 16) [x, y, w, h] = [0, 0, vw, vh];
+  const f = settings.lineMultiplier;
+  const ox = Math.round((w * settings.overscan) / 100);
+  const oy = Math.round((h * settings.overscan) / 100 / f) * f;
+  if (w - 2 * ox >= 16 && h - 2 * oy >= 16) {
+    x += ox; w -= 2 * ox;
+    y += oy; h -= 2 * oy;
+  }
+  return { x, y, w, h };
+}
+
+/** Renderer layout, in device pixels. See VideoRenderer.configure. */
+function layout(vw, vh, cw, ch) {
+  const crop = cropRect(vw, vh);
+  const stretch = settings.aspect === "stretch";
+  const ar = ASPECTS[settings.aspect] ?? crop.w / crop.h;
+  let w = 0, h = 0, note;
+  if (settings.scaling === "integer") {
+    // A whole number of screen pixels per source line, so every line is the same height.
+    const lines = crop.h / settings.lineMultiplier;
+    let k = Math.floor(ch / lines);
+    while (k >= 1 && !stretch && Math.round(k * lines * ar) > cw) k--;
+    if (k >= 1) {
+      h = Math.round(k * lines);
+      w = stretch ? cw : Math.round(h * ar);
+      note = `${k}x of ${+lines.toFixed(1)} lines`;
+    } else note = "window too small for whole pixels";
+  }
+  if (!w) {
+    if (stretch) [w, h] = [cw, ch];
+    else if (cw / ch > ar) [w, h] = [Math.round(ch * ar), ch];
+    else [w, h] = [cw, Math.round(cw / ar)];
+  }
+  return { crop, dest: { x: Math.floor((cw - w) / 2), y: Math.floor((ch - h) / 2), w, h }, note };
+}
+
+const cropped = () => CROP_SIDES.some((k) => settings.crop[k] > 0);
+const needsRenderer = () =>
+  settings.scaling !== "off" || settings.aspect !== "source" || settings.overscan > 0 || cropped();
+
+function showCrop() {
+  const vw = els.video.videoWidth || settings.crop.w;
+  const vh = els.video.videoHeight || settings.crop.h;
+  const b = vw && vh ? cropBorders(vw, vh) : settings.crop;
+  for (const k of CROP_SIDES) els.crop[k].value = b[k];
+}
+
+function applyPicture() {
+  const want = needsRenderer();
+  if (want && !renderer) {
     try {
-      fsr = new FsrRenderer(els.fsrCanvas, els.video, (s) => (els.fsrStatus.textContent = s));
+      renderer = new VideoRenderer(els.canvas, els.video, (s) => (els.pictureStatus.textContent = s));
+      renderer.configure({ layout });
     } catch (e) {
-      settings.scaling = "off";
-      els.fsrStatus.textContent = `FSR unavailable: ${e.message}`;
+      renderer = null;
+      els.pictureStatus.textContent = `Picture processing unavailable (${e.message}). Showing the plain video.`;
     }
   }
-  const on = settings.scaling === "fsr";
-  fsr?.setSharpness(settings.sharpness);
-  fsr?.setEnabled(on);
+  if (renderer) {
+    renderer.configure({ filter: FILTERS[settings.scaling] ?? "linear" });
+    renderer.setSharpness(settings.sharpness);
+    renderer.setEnabled(want);
+  }
   els.scaling.value = settings.scaling;
+  els.aspect.value = settings.aspect;
   els.sharpness.value = settings.sharpness;
   els.sharpnessText.textContent = `${settings.sharpness}%`;
-  els.sharpnessRow.hidden = !on;
+  els.sharpnessRow.hidden = settings.scaling !== "fsr";
+  els.lineMultiplier.value = String(settings.lineMultiplier);
+  els.lineMultiplierRow.hidden = settings.scaling !== "integer";
+  els.overscan.value = settings.overscan;
+  els.overscanText.textContent = `${settings.overscan}%`;
+  showCrop();
   save();
+}
+
+function cropEdited() {
+  const vw = els.video.videoWidth, vh = els.video.videoHeight;
+  if (!vw || !vh) return;
+  const c = { w: vw, h: vh };
+  for (const k of CROP_SIDES) c[k] = Math.max(0, Math.round(+els.crop[k].value || 0));
+  settings.crop = c;
+  applyPicture();
+}
+
+/** Grabs the current frame as luma (full resolution). */
+function grabLuma(width, height) {
+  const v = els.video;
+  if (!v.videoWidth) return null;
+  const w = width ?? v.videoWidth;
+  const h = height ?? v.videoHeight;
+  const c = Object.assign(document.createElement("canvas"), { width: w, height: h });
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(v, 0, 0, w, h);
+  return { Y: lumaOf(ctx.getImageData(0, 0, w, h).data, w, h), w, h };
+}
+
+/** "Detect": crop to the picture and find the line multiplier. */
+function detectPicture() {
+  const frame = grabLuma();
+  if (!frame) return osd("No video to look at yet.", 2500);
+  const r = findPicture(frame.Y, frame.w, frame.h);
+  if (r.error) return osd("The picture is black. Try again on a bright screen.", 3500);
+  settings.crop = { ...r.crop, w: frame.w, h: frame.h };
+  settings.lineMultiplier = r.factor;
+  applyPicture();
+  const w = frame.w - r.crop.left - r.crop.right;
+  const h = frame.h - r.crop.top - r.crop.bottom;
+  const lines = r.factor > 1 ? `, each line repeated ${r.factor}x (${h / r.factor} source lines)`
+    : r.detail ? ", no line multiplier" : ". Too little detail to check for a line multiplier";
+  osd(`Picture: ${w} x ${h}${lines}`, 4000);
 }
 
 // ---------------------------------------------------------------- audio
@@ -317,6 +444,199 @@ const actions = {
 };
 
 function stopStream(s) { s?.getTracks().forEach((t) => t.stop()); }
+
+// ---------------------------------------------------------------- stats overlay
+// Video numbers come from requestVideoFrameCallback and the track; audio numbers
+// from the Rust engine (audio_stats). Ctrl+I or Window → Show stats.
+const stats = { on: false, handle: 0, timer: 0, last: null, presented: 0, now: 0, latency: [], base: null };
+
+function setStats(on) {
+  stats.on = on;
+  settings.showStats = on;
+  save();
+  els.showStats.checked = on;
+  els.stats.hidden = !on;
+  if (on) startStats();
+  else {
+    if (stats.handle) els.video.cancelVideoFrameCallback?.(stats.handle);
+    clearInterval(stats.timer);
+    stats.handle = stats.timer = 0;
+  }
+}
+
+function startStats() {
+  if (stats.handle) els.video.cancelVideoFrameCallback?.(stats.handle);
+  clearInterval(stats.timer);
+  stats.last = null;
+  stats.base = null;
+  stats.latency = [];
+  const onFrame = (now, meta) => {
+    stats.presented = meta.presentedFrames;
+    stats.now = now;
+    // Camera frames carry a capture time in Chromium: capture -> display latency.
+    if (meta.captureTime) {
+      stats.latency.push(meta.expectedDisplayTime - meta.captureTime);
+      if (stats.latency.length > 120) stats.latency.shift();
+    }
+    stats.handle = els.video.requestVideoFrameCallback(onFrame);
+  };
+  if (els.video.requestVideoFrameCallback) stats.handle = els.video.requestVideoFrameCallback(onFrame);
+  stats.timer = setInterval(renderStats, 500);
+  renderStats();
+}
+
+function videoCounters() {
+  const q = els.video.getVideoPlaybackQuality?.();
+  const t = videoStream?.getVideoTracks()[0]?.stats; // MediaStreamTrackVideoStats, newer Chromium
+  return { dropped: q?.droppedVideoFrames ?? 0, discarded: t?.discardedFrames ?? 0 };
+}
+
+const fmt = (n, digits = 0) => (Number.isFinite(n) ? n.toFixed(digits) : "-");
+const dB = (peak) => (peak > 0.00003 ? `${fmt(20 * Math.log10(peak))} dB` : "silent");
+const median = (a) => {
+  if (!a.length) return NaN;
+  const s = [...a].sort((x, y) => x - y);
+  return s[s.length >> 1];
+};
+
+async function renderStats() {
+  const lines = [];
+  const track = videoStream?.getVideoTracks()[0];
+  if (track && track.readyState === "live") {
+    const st = track.getSettings();
+    const asked = parseMode(settings.mode);
+    lines.push(`Video   ${st.width}x${st.height} @ ${fmt(st.frameRate, 2)} from the device` +
+      (st.width !== asked.width || st.height !== asked.height || Math.round(st.frameRate) !== asked.frameRate
+        ? ` (asked ${settings.mode})` : ""));
+    const counters = videoCounters();
+    stats.base ??= counters;
+    let fps = NaN;
+    if (stats.last && stats.now > stats.last.now) {
+      fps = ((stats.presented - stats.last.presented) * 1000) / (stats.now - stats.last.now);
+    }
+    stats.last = { presented: stats.presented, now: stats.now };
+    const dropped = counters.dropped - stats.base.dropped + counters.discarded - stats.base.discarded;
+    const lat = median(stats.latency);
+    lines.push(`Shown   ${fmt(fps, 1)} fps · dropped ${dropped}` +
+      (Number.isFinite(lat) ? ` · capture to screen ${fmt(lat)} ms` : ""));
+  } else {
+    lines.push("Video   no signal");
+  }
+  lines.push(`Picture ${renderer?.enabled ? renderer.lastStatus || "-" : "plain video (no processing)"}`);
+
+  try {
+    const a = await invoke("audio_stats");
+    const src = (name, s) => {
+      if (!s.active) return `${name}off`;
+      return `${name}${s.rate} Hz · buffer ${fmt(s.fill_ms)}/${fmt(s.target_ms)} ms · ` +
+        `underruns ${s.underruns} · skips ${s.skips} · peak ${dB(s.peak)}`;
+    };
+    lines.push(src("Game    ", a.game));
+    lines.push(src("Music   ", a.music));
+    if (a.output_rate) {
+      lines.push(`Output  ${a.output_rate} Hz · ${fmt(a.buffer_ms, 1)} ms per callback · ` +
+        `device ${fmt(a.latency_ms, 1)} ms` + (a.clipped ? " · CLIPPING (lower the volume)" : ""));
+    }
+  } catch (e) {
+    lines.push(`Audio   ${e}`);
+  }
+  if (stats.on) els.stats.textContent = lines.join("\n");
+}
+
+// ---------------------------------------------------------------- A/V sync helper
+// Play a flash-and-beep test on the console (240p Test Suite's audio sync test,
+// or a "flash and beep" video). We time each flash as it reaches the screen and
+// each beep as it reaches the output device, then set Audio delay to line them up.
+const SYNC_PAIRS = 8;
+const SYNC_TIMEOUT_MS = 25000;
+let sync = null;
+
+/** Offset from performance.now() to the audio engine's clock, over the fastest of a few round trips. */
+async function audioClockOffset() {
+  let best = null;
+  for (let i = 0; i < 5; i++) {
+    const t0 = performance.now();
+    const rust = await invoke("audio_clock");
+    const t1 = performance.now();
+    if (!best || t1 - t0 < best.rtt) best = { rtt: t1 - t0, offset: rust - (t0 + t1) / 2 };
+  }
+  return best.offset;
+}
+
+async function measureSync() {
+  const say = (t) => (els.syncStatus.textContent = t);
+  if (!videoStream || !els.video.requestVideoFrameCallback) return say("No video to measure.");
+  if (!audioRunning || !els.audioDevice.value) return say("Choose the capture card under Input first.");
+  const offset = await audioClockOffset();
+  await invoke("audio_sync_probe", { on: true });
+
+  const W = 160, H = 90;
+  const canvas = Object.assign(document.createElement("canvas"), { width: W, height: H });
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const s = (sync = { flashes: [], beeps: [], prev: null, handle: 0, poll: 0, timeout: 0, startDelay: settings.delay });
+
+  const pairs = () => {
+    const out = [];
+    for (const f of s.flashes) {
+      let best = null;
+      for (const b of s.beeps) if (Math.abs(b - f) < 400 && (best === null || Math.abs(b - f) < Math.abs(best - f))) best = b;
+      if (best !== null) out.push(best - f); // > 0: sound heard after the picture
+    }
+    return out;
+  };
+
+  s.finish = (why) => {
+    if (sync !== s) return;
+    sync = null;
+    els.video.cancelVideoFrameCallback?.(s.handle);
+    clearInterval(s.poll);
+    clearTimeout(s.timeout);
+    invoke("audio_sync_probe", { on: false }).catch(() => {});
+    els.measureSync.textContent = "Measure A/V sync";
+    const d = pairs();
+    if (why) return say(why);
+    if (d.length < 3) {
+      return say(`Not enough matches: saw ${s.flashes.length} flashes and ${s.beeps.length} beeps. ` +
+        "Is the test playing, with its sound coming through the capture card?");
+    }
+    const late = median(d);
+    const spread = median(d.map((x) => Math.abs(x - late)));
+    const wanted = s.startDelay - late;
+    const next = Math.max(0, Math.min(500, Math.round(wanted / 10) * 10));
+    settings.delay = next;
+    applyDelay();
+    const where = Math.abs(late) < 5 ? "in sync"
+      : late > 0 ? `${fmt(late)} ms behind the picture` : `${fmt(-late)} ms ahead of the picture`;
+    let text = `Sound was ${where} (${d.length} matches, ±${fmt(spread)} ms). Audio delay: ${s.startDelay} → ${next} ms.`;
+    if (wanted < -10) text += " Sound is late even with no delay; the app can't delay the picture.";
+    if (spread > 20) text += " The matches varied a lot: measure again to check.";
+    else text += " Measure again to confirm.";
+    say(text);
+  };
+
+  const onFrame = (now, meta) => {
+    if (sync !== s) return;
+    ctx.drawImage(els.video, 0, 0, W, H);
+    const Y = lumaOf(ctx.getImageData(0, 0, W, H).data, W, H);
+    if (s.prev && flashFraction(s.prev, Y) > 0.1) {
+      const t = meta.expectedDisplayTime ?? now;
+      if (!s.flashes.length || t - s.flashes.at(-1) > 250) s.flashes.push(t);
+    }
+    s.prev = Y;
+    s.handle = els.video.requestVideoFrameCallback(onFrame);
+  };
+  s.handle = els.video.requestVideoFrameCallback(onFrame);
+  s.poll = setInterval(async () => {
+    const onsets = await invoke("audio_sync_onsets").catch(() => []);
+    s.beeps.push(...onsets.map((t) => t - offset));
+    const n = pairs().length;
+    say(`Measuring... ${n}/${SYNC_PAIRS} (${s.flashes.length} flashes, ${s.beeps.length} beeps)`);
+    if (n >= SYNC_PAIRS) s.finish();
+  }, 250);
+  s.timeout = setTimeout(() => s.finish(), SYNC_TIMEOUT_MS);
+  els.measureSync.textContent = "Stop";
+  say("Measuring... play the flash-and-beep test now.");
+}
 
 // ---------------------------------------------------------------- hotkeys
 const hotkeyButtons = [...document.querySelectorAll(".hotkey")];
@@ -497,8 +817,26 @@ function wire() {
   document.addEventListener("dblclick", (e) => {
     if (!els.panel.contains(e.target) && e.target !== els.gear) toggleFullscreen();
   });
-  els.scaling.addEventListener("change", () => { settings.scaling = els.scaling.value; applyScaling(); });
-  els.sharpness.addEventListener("input", () => { settings.sharpness = +els.sharpness.value; applyScaling(); });
+  els.scaling.addEventListener("change", () => { settings.scaling = els.scaling.value; applyPicture(); });
+  els.sharpness.addEventListener("input", () => { settings.sharpness = +els.sharpness.value; applyPicture(); });
+  els.aspect.addEventListener("change", () => { settings.aspect = els.aspect.value; applyPicture(); });
+  els.overscan.addEventListener("input", () => { settings.overscan = +els.overscan.value; applyPicture(); });
+  els.lineMultiplier.addEventListener("change", () => {
+    settings.lineMultiplier = +els.lineMultiplier.value || 1;
+    applyPicture();
+  });
+  for (const k of CROP_SIDES) els.crop[k].addEventListener("change", cropEdited);
+  els.detect.addEventListener("click", detectPicture);
+  els.resetCrop.addEventListener("click", () => {
+    settings.crop = { top: 0, bottom: 0, left: 0, right: 0, w: 0, h: 0 };
+    settings.overscan = 0;
+    settings.lineMultiplier = 1;
+    applyPicture();
+  });
+  els.video.addEventListener("loadedmetadata", showCrop);
+  els.video.addEventListener("resize", showCrop);
+  els.showStats.addEventListener("change", () => setStats(els.showStats.checked));
+  els.measureSync.addEventListener("click", () => (sync ? sync.finish("Stopped.") : measureSync()));
 
   document.addEventListener("contextmenu", (e) => {
     e.preventDefault();
@@ -516,6 +854,9 @@ function wire() {
     } else if ((e.ctrlKey && e.code === "KeyH") || (IS_MAC && e.metaKey && e.code === "Comma")) {
       e.preventDefault();
       togglePanel();
+    } else if (e.ctrlKey && e.code === "KeyI") {
+      e.preventDefault();
+      setStats(!stats.on);
     }
   });
   document.addEventListener("pointermove", poke);
@@ -543,7 +884,8 @@ async function main() {
   applyLevel("game", false);
   applyLevel("music", false);
   applyDelay();
-  applyScaling();
+  applyPicture();
+  if (settings.showStats) setStats(true);
   els.onTop.checked = settings.onTop;
   els.game.value = settings.game;
   els.console.value = settings.console;
