@@ -1,8 +1,15 @@
-// FSR 1 (AMD FidelityFX Super Resolution 1.0) for the capture feed, in WebGL2.
-//   Pass 1 - EASU: edge-adaptive upscale from the video size to the on-screen size
-//            (plain bilinear when the window is smaller than the video).
-//   Pass 2 - RCAS: robust contrast-adaptive sharpening at output resolution.
-// Port of the algorithm in ffx_fsr1.h (MIT, AMD), written for texelFetch.
+// WebGL2 renderer for the capture feed, used whenever the plain <video> element
+// isn't enough: cropping, a forced aspect ratio, sharp / integer scaling, or FSR.
+// main.js supplies a layout function (which part of the frame, and where on the
+// canvas) and picks a filter:
+//   linear  - bilinear, one pass.
+//   nearest - nearest-neighbour ("sharp pixels"), one pass. Integer scaling is
+//             nearest with a layout that uses a whole number of pixels per line.
+//   fsr     - FSR 1 (AMD FidelityFX Super Resolution 1.0), two passes:
+//             EASU edge-adaptive upscale from the crop to the on-screen size
+//             (plain bilinear when the window is smaller), then RCAS robust
+//             contrast-adaptive sharpening at output resolution.
+//             Port of the algorithm in ffx_fsr1.h (MIT, AMD), written for texelFetch.
 // Renders once per new video frame (requestVideoFrameCallback), so it adds no
 // queueing; the GPU cost at 1440p is a fraction of a millisecond.
 
@@ -12,15 +19,44 @@ void main() {
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
+// Single pass from the crop to the output rectangle, bilinear or nearest.
+const SIMPLE = `#version 300 es
+precision highp float;
+uniform sampler2D u_src;
+uniform vec2 u_texSize; // whole video frame
+uniform vec2 u_inOff;   // crop origin (texels, from the top left)
+uniform vec2 u_inSize;  // crop size
+uniform vec2 u_outSize; // output rectangle size
+uniform vec2 u_offset;  // output rectangle origin in window coordinates (bottom left)
+uniform int u_nearest;
+out vec4 o;
+
+void main() {
+  vec2 op = vec2(gl_FragCoord.x - u_offset.x, u_outSize.y - (gl_FragCoord.y - u_offset.y));
+  vec2 sp = u_inOff + op * (u_inSize / u_outSize);
+  if (u_nearest == 1) {
+    ivec2 lo = ivec2(u_inOff);
+    o = vec4(texelFetch(u_src, clamp(ivec2(floor(sp)), lo, lo + ivec2(u_inSize) - 1), 0).rgb, 1.0);
+  } else {
+    sp = clamp(sp, u_inOff + 0.5, u_inOff + u_inSize - 0.5); // no bleed from outside the crop
+    o = vec4(texture(u_src, sp / u_texSize).rgb, 1.0);
+  }
+}`;
+
 const EASU = `#version 300 es
 precision highp float;
 uniform sampler2D u_src;
+uniform vec2 u_texSize;
+uniform vec2 u_inOff;
 uniform vec2 u_inSize;
 uniform vec2 u_outSize;
 uniform int u_mode; // 0 = bilinear, 1 = EASU
 out vec4 o;
 
-vec3 T(ivec2 p) { return texelFetch(u_src, clamp(p, ivec2(0), ivec2(u_inSize) - 1), 0).rgb; }
+vec3 T(ivec2 p) {
+  ivec2 lo = ivec2(u_inOff);
+  return texelFetch(u_src, clamp(p, lo, lo + ivec2(u_inSize) - 1), 0).rgb;
+}
 float Lu(vec3 c) { return c.g + 0.5 * (c.r + c.b); }
 
 void setF(inout vec2 dir, inout float len, float w,
@@ -51,10 +87,11 @@ void main() {
   // Output pixel centre, top-down (video texture row 0 is the top of the image).
   vec2 op = vec2(gl_FragCoord.x, u_outSize.y - gl_FragCoord.y);
   if (u_mode == 0) {
-    o = vec4(texture(u_src, op / u_outSize).rgb, 1.0);
+    vec2 sp = clamp(u_inOff + op * (u_inSize / u_outSize), u_inOff + 0.5, u_inOff + u_inSize - 0.5);
+    o = vec4(texture(u_src, sp / u_texSize).rgb, 1.0);
     return;
   }
-  vec2 pp = op * (u_inSize / u_outSize) - 0.5;
+  vec2 pp = u_inOff + op * (u_inSize / u_outSize) - 0.5;
   vec2 fp = floor(pp);
   vec2 f = pp - fp;
   ivec2 i = ivec2(fp);
@@ -155,14 +192,28 @@ function compile(gl, vsSrc, fsSrc) {
   return { prog, u };
 }
 
-export class FsrRenderer {
+/** Default layout: whole frame, fitted and centred. */
+function fitLayout(vw, vh, cw, ch) {
+  const s = Math.min(cw / vw, ch / vh);
+  const w = Math.max(1, Math.round(vw * s));
+  const h = Math.max(1, Math.round(vh * s));
+  return {
+    crop: { x: 0, y: 0, w: vw, h: vh },
+    dest: { x: Math.floor((cw - w) / 2), y: Math.floor((ch - h) / 2), w, h },
+  };
+}
+
+export class VideoRenderer {
   constructor(canvas, video, onStatus = () => {}) {
     this.canvas = canvas;
     this.video = video;
     this.onStatus = onStatus;
     this.enabled = false;
+    this.filter = "linear";
+    this.layout = fitLayout;
     this.sharp = Math.pow(2, -0.4);
     this.frameHandle = 0;
+    this.lastStatus = "";
 
     const gl = canvas.getContext("webgl2", {
       alpha: false, antialias: false, depth: false, stencil: false,
@@ -172,6 +223,7 @@ export class FsrRenderer {
     });
     if (!gl) throw new Error("WebGL2 unavailable");
     this.gl = gl;
+    this.simple = compile(gl, VERT, SIMPLE);
     this.easu = compile(gl, VERT, EASU);
     this.rcas = compile(gl, VERT, RCAS);
     gl.bindVertexArray(gl.createVertexArray());
@@ -208,6 +260,18 @@ export class FsrRenderer {
     if (this.enabled) this.#draw();
   }
 
+  /**
+   * filter: "linear" | "nearest" | "fsr".
+   * layout(videoW, videoH, canvasW, canvasH) -> { crop, dest, note? } in device
+   * pixels; crop is part of the video frame, dest the rectangle on the canvas
+   * (both {x, y, w, h}, measured from the top left).
+   */
+  configure({ filter, layout }) {
+    if (filter) this.filter = filter;
+    if (layout) this.layout = layout;
+    if (this.enabled) this.#draw();
+  }
+
   /** 0..100 -> RCAS stops 2..0 (100 = strongest). */
   setSharpness(percent) {
     this.sharp = Math.pow(2, -((100 - percent) / 50));
@@ -220,8 +284,10 @@ export class FsrRenderer {
     this.canvas.hidden = !on;
     if (this.frameHandle) this.video.cancelVideoFrameCallback?.(this.frameHandle);
     this.frameHandle = 0;
-    if (on) this.#schedule();
-    else {
+    if (on) {
+      this.#schedule();
+      this.#draw();
+    } else {
       this.lastStatus = "";
       this.onStatus("");
     }
@@ -242,16 +308,49 @@ export class FsrRenderer {
     if (!vw || !vh) return;
     const cw = this.canvas.width;
     const ch = this.canvas.height;
-    const s = Math.min(cw / vw, ch / vh);
-    const ow = Math.max(1, Math.round(vw * s));
-    const oh = Math.max(1, Math.round(vh * s));
-    const ox = Math.floor((cw - ow) / 2);
-    const oy = Math.floor((ch - oh) / 2);
-    const upscaling = ow > vw;
+    const { crop, dest, note } = this.layout(vw, vh, cw, ch);
+    const ow = Math.max(1, Math.round(dest.w));
+    const oh = Math.max(1, Math.round(dest.h));
+    const ox = Math.round(dest.x);
+    const oy = ch - Math.round(dest.y) - oh; // GL viewports count from the bottom
 
     // Upload the current video frame (GPU-to-GPU copy in Chromium).
     gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, cw, ch);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    let status;
+    if (this.filter === "fsr") status = this.#drawFsr(vw, vh, crop, ow, oh, ox, oy);
+    else {
+      gl.viewport(ox, oy, ow, oh);
+      const p = this.simple;
+      gl.useProgram(p.prog);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
+      gl.uniform1i(p.u.u_src, 0);
+      gl.uniform2f(p.u.u_texSize, vw, vh);
+      gl.uniform2f(p.u.u_inOff, crop.x, crop.y);
+      gl.uniform2f(p.u.u_inSize, crop.w, crop.h);
+      gl.uniform2f(p.u.u_outSize, ow, oh);
+      gl.uniform2f(p.u.u_offset, ox, oy);
+      gl.uniform1i(p.u.u_nearest, this.filter === "nearest" ? 1 : 0);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      status = `${this.filter === "nearest" ? "Sharp" : "Smooth"}: ${crop.w}x${crop.h} -> ${ow}x${oh}`;
+    }
+    if (note) status += ` (${note})`;
+    if (status !== this.lastStatus) {
+      this.lastStatus = status;
+      this.onStatus(status);
+    }
+  }
+
+  #drawFsr(vw, vh, crop, ow, oh, ox, oy) {
+    const { gl } = this;
+    const upscaling = ow > crop.w || oh > crop.h;
 
     // Pass 1 -> intermediate texture at output size.
     if (this.midW !== ow || this.midH !== oh) {
@@ -268,16 +367,15 @@ export class FsrRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.srcTex);
     gl.uniform1i(this.easu.u.u_src, 0);
-    gl.uniform2f(this.easu.u.u_inSize, vw, vh);
+    gl.uniform2f(this.easu.u.u_texSize, vw, vh);
+    gl.uniform2f(this.easu.u.u_inOff, crop.x, crop.y);
+    gl.uniform2f(this.easu.u.u_inSize, crop.w, crop.h);
     gl.uniform2f(this.easu.u.u_outSize, ow, oh);
     gl.uniform1i(this.easu.u.u_mode, upscaling ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    // Pass 2 -> screen, letterboxed.
+    // Pass 2 -> screen.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, cw, ch);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
     gl.viewport(ox, oy, ow, oh);
     gl.useProgram(this.rcas.prog);
     gl.bindTexture(gl.TEXTURE_2D, this.midTex);
@@ -287,12 +385,8 @@ export class FsrRenderer {
     gl.uniform1f(this.rcas.u.u_sharp, this.sharp);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    const status = upscaling
-      ? `FSR: ${vw}x${vh} -> ${ow}x${oh} (${(ow / vw).toFixed(2)}x upscale + sharpen)`
-      : `FSR: window is not larger than ${vw}x${vh} - sharpening only`;
-    if (status !== this.lastStatus) {
-      this.lastStatus = status;
-      this.onStatus(status);
-    }
+    return upscaling
+      ? `FSR: ${crop.w}x${crop.h} -> ${ow}x${oh} (${(ow / crop.w).toFixed(2)}x upscale + sharpen)`
+      : `FSR: window is not larger than ${crop.w}x${crop.h} - sharpening only`;
   }
 }

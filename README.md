@@ -11,6 +11,7 @@ you set under *Now playing*). The game's sound plays from the app itself, so it 
 
 - [Install](#install)
 - [Using it](#using-it)
+- [Retro consoles (line multipliers)](#retro-consoles-line-multipliers)
 - [Mixing in music](#mixing-in-music)
 - [Discord status](#discord-status-rich-presence)
 - [Troubleshooting](#troubleshooting)
@@ -53,6 +54,7 @@ starting Local Streamer.
 | --- | --- | --- |
 | Settings panel | Right-click, the gear icon (top right), or Ctrl+H | Right-click, the gear icon, Ctrl+H or ⌘, |
 | Fullscreen | F11 or double-click. Esc to leave. | ⌃⌘F, the green window button, or double-click. Esc to leave. |
+| Stats overlay | Ctrl+I | ⌃I |
 | Game volume up / down / mute (global) | Ctrl+Alt+Up / Down / M | ⌃⌥Up / Down / M |
 | Music volume up / down / mute (global) | Ctrl+Alt+Shift+Up / Down / M | ⌃⌥⇧Up / Down / M |
 
@@ -64,12 +66,43 @@ In the settings panel:
 - **Now playing**: game and console. They become the window title (for example
   "Halo 3 · Xbox 360"), which is the name Discord shows in its share picker. Previous entries are
   suggested next time.
-- **Video**: capture device, resolution / frame rate, and scaling. *AMD FSR 1* upscales with EASU
-  and sharpens with RCAS using WebGL, on any GPU. When the window is smaller than the video it only
-  sharpens.
+- **Video**: capture device, resolution / frame rate, scaling, aspect ratio and crop.
+  - *Scaling*: *Standard* is smooth. *Sharp pixels* uses nearest neighbour, for pixel art.
+    *Integer scale* is sharp too, and gives every source line the same number of screen pixels.
+    *AMD FSR 1* upscales with EASU and sharpens with RCAS using WebGL, on any GPU; when the window
+    is smaller than the video it only sharpens.
+  - *Aspect ratio*: as captured, 4:3, 16:9, or stretched to the window.
+  - *Crop* trims black bars, and *Overscan* trims a little more off every edge.
+    *Detect borders and line multiplier* fills in the crop from the current frame, so run it on
+    a bright, detailed screen.
 - **Audio**: the capture input (for example "HDMI (Elgato 4K S)"), the output you listen on,
   volume up to 200% for quiet sources, and an audio delay for when sound arrives before the picture.
-- **Window**: always on top, fullscreen.
+  *Measure A/V sync* sets the delay for you (see [Retro consoles](#retro-consoles-line-multipliers)
+  for a test to play).
+- **Window**: always on top, fullscreen, and a stats overlay (frame rate, dropped frames, audio
+  buffers, clipping). The overlay is part of the window, so Discord's share shows it too.
+
+## Retro consoles (line multipliers)
+
+With a line multiplier such as a RetroTINK 5X Pro between the console and the capture card, each
+source line arrives repeated a whole number of times (5 in the 5X's 5x mode, 4 in 4x mode).
+
+1. Turn off the scaler's own scanlines.
+2. Open the settings panel on a bright, detailed screen and press **Detect borders and line
+   multiplier**. It crops the black bars and finds the multiplier.
+3. Set **Scaling** to **Integer scale**. Every source line then gets the same number of screen
+   pixels, so there's no uneven shimmer. For even lines at full height, use 5x mode on a 1080p or
+   4K screen and 4x mode on a 1440p screen.
+4. Set **Aspect ratio** to **4:3** if the console's picture isn't already 4:3.
+
+If a game switches between 240p and 480i (some PlayStation games do), run Detect again on the new
+mode.
+
+**A/V sync:** play a flash-and-beep test on the console, such as the 240p Test Suite's audio sync
+test or a "flash and beep" video, and press **Audio → Measure A/V sync**. The app times about
+eight flashes as they reach the screen against their beeps as they reach your output device, then
+sets **Audio delay**. Measure again to confirm. The game audio must come through the capture card.
+The app can only delay the sound, so if sound is late with no delay at all, it says so.
 
 The app remembers your devices, mode, volumes, hotkeys and window position.
 
@@ -103,8 +136,10 @@ Streamer plays to.
 
 ## Discord status (Rich Presence)
 
-Optional. Shows "Playing &lt;game&gt;" and "on &lt;console&gt;" on your Discord profile. One-time
-setup: go to [discord.com/developers/applications](https://discord.com/developers/applications),
+Optional. Shows "Playing &lt;game&gt;" and "on &lt;console&gt;" on your Discord profile. The app
+sends the game as the activity name. Discord versions that ignore it show the application's name
+in the profile card's header (so name it something generic like "Console"), with the game on the
+line below and in the member list. One-time setup: go to [discord.com/developers/applications](https://discord.com/developers/applications),
 click **New Application**, name it (for example "Console"), then paste its **Application ID** into
 **Now playing → Discord status** in the settings panel. Leave it empty to turn it off. The Discord
 desktop app must be running.
@@ -118,7 +153,9 @@ desktop app must be running.
 | macOS: "Camera access is off" | System Settings → Privacy & Security → Camera → turn on Local Streamer, then reopen the app. |
 | No video devices listed | Replug the card. On macOS, check that Local Streamer has Camera access. |
 | No sound | Pick the card's audio under **Audio → Input**. On macOS, check Microphone access. |
-| Sound is ahead of the picture | Raise **Audio delay**. |
+| Sound is ahead of the picture | Raise **Audio delay**, or use **Measure A/V sync**. |
+| Stuttering, crackles or gaps in the sound | Turn on the stats overlay (Ctrl+I / ⌃I). Rising *dropped* or *underruns* counts point to the cause, and *CLIPPING* means the volume is too high. |
+| Discord profile shows the application's name, not the game | That Discord version ignores the activity name. The game still shows on the line below and in the member list. Rename the application in the developer portal to something generic, like "Console". |
 | A hotkey button has a red border | Another app already uses that combination. Pick a different one. |
 | macOS: "Local Streamer is damaged" or "can't be opened" | It's the quarantine flag on an un-notarized app. See [Install](#macos-12-or-later-apple-silicon-and-intel). |
 | Discord share has no sound | Share the **Local Streamer window** (Applications tab), not the whole screen. On macOS, app audio in window shares depends on Discord's macOS support and your Discord / macOS version. |
@@ -161,7 +198,8 @@ The app version is taken from the tag.
 ## How it works
 
 - The front end (`tauri/src/`) is plain HTML/CSS/JS with no bundler. `getUserMedia` opens the
-  capture card and the picture goes to a `<video>` element (or a WebGL canvas when FSR is on).
+  capture card and the picture goes to a `<video>` element, or a WebGL canvas for crop, aspect,
+  sharp / integer scaling and FSR.
 - Sound does **not** go through the webview. Both system webviews play audio from a helper
   process (`msedgewebview2.exe` on Windows, WebKit's WebContent process on macOS), and Discord's
   window share doesn't attribute that to the app. Instead, `tauri/src-tauri/src/audio.rs`

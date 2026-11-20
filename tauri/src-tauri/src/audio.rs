@@ -16,6 +16,12 @@
 //! Each source has its own FIFO. Its fill level *is* that source's latency:
 //! we hold it near a target, dropping the oldest audio if it grows (clock
 //! drift) and re-priming with silence if it runs dry.
+//!
+//! Diagnostics: per-source FIFO fill, underruns, skips and peaks, plus output
+//! buffer / latency / clipping, are kept in atomics for the stats overlay
+//! (`stats`). For the A/V sync helper, `sync_probe` turns on a beep (onset)
+//! detector on the game source; onsets are timestamped on `clock_ms`'s clock at
+//! the moment they reach the output device.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig};
@@ -23,6 +29,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const GAME_BASE_MS: u32 = 15; // jitter cushion for the capture card
 const MUSIC_BASE_MS: u32 = 30; // loopback arrives in ~10ms packets, give it more room
@@ -55,19 +62,122 @@ impl Level {
     }
 }
 
+/// Live numbers for one source, written by the audio callbacks.
+#[derive(Default)]
+struct SourceStats {
+    active: AtomicBool,
+    rate: AtomicU32,
+    target: AtomicU32,    // frames the FIFO is held at
+    fill: AtomicU32,      // frames queued when the latest output callback started (= latency)
+    underruns: AtomicU32, // FIFO ran dry (heard as a gap)
+    skips: AtomicU32,     // FIFO overshot and old audio was dropped
+    peak: AtomicU32,      // f32 bits, max |sample| (before volume) since the last read
+}
+
+impl SourceStats {
+    fn reset(&self) {
+        self.active.store(false, Ordering::Relaxed);
+        for a in [&self.rate, &self.target, &self.fill, &self.underruns, &self.skips, &self.peak] {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+    fn snapshot(&self) -> SourceSnapshot {
+        let rate = self.rate.load(Ordering::Relaxed).max(1) as f32;
+        SourceSnapshot {
+            active: self.active.load(Ordering::Relaxed),
+            rate: self.rate.load(Ordering::Relaxed),
+            target_ms: self.target.load(Ordering::Relaxed) as f32 * 1000.0 / rate,
+            fill_ms: self.fill.load(Ordering::Relaxed) as f32 * 1000.0 / rate,
+            underruns: self.underruns.load(Ordering::Relaxed),
+            skips: self.skips.load(Ordering::Relaxed),
+            // Non-negative f32s order the same as their bits, so fetch_max works on them.
+            peak: f32::from_bits(self.peak.swap(0, Ordering::Relaxed)),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OutputStats {
+    rate: AtomicU32,
+    buffer: AtomicU32,     // frames per callback
+    latency_us: AtomicU32, // callback -> sound leaving the device, as the host reports it
+    clipped: AtomicU32,    // samples clamped to +-1 since the last read
+}
+
+/// Beep detector for the A/V sync helper.
+#[derive(Default)]
+struct SyncProbe {
+    on: AtomicBool,
+    onsets: Mutex<Vec<f64>>, // clock_ms() at which each beep is heard
+}
+
 pub struct Shared {
     game: Level,
     music: Level,
     delay_ms: AtomicU32, // game only (A/V sync)
+    epoch: Instant,
+    game_stats: SourceStats,
+    music_stats: SourceStats,
+    out: OutputStats,
+    probe: SyncProbe,
 }
 
 impl Shared {
+    fn new() -> Self {
+        Self {
+            game: Level::new(0.8),
+            music: Level::new(0.5),
+            delay_ms: AtomicU32::new(0),
+            epoch: Instant::now(),
+            game_stats: SourceStats::default(),
+            music_stats: SourceStats::default(),
+            out: OutputStats::default(),
+            probe: SyncProbe::default(),
+        }
+    }
     fn level(&self, c: Channel) -> &Level {
         match c {
             Channel::Game => &self.game,
             Channel::Music => &self.music,
         }
     }
+    fn stats(&self, c: Channel) -> &SourceStats {
+        match c {
+            Channel::Game => &self.game_stats,
+            Channel::Music => &self.music_stats,
+        }
+    }
+    fn now_ms(&self) -> f64 {
+        self.epoch.elapsed().as_secs_f64() * 1000.0
+    }
+}
+
+#[derive(serde::Serialize)]
+pub struct SourceSnapshot {
+    active: bool,
+    rate: u32,
+    target_ms: f32,
+    fill_ms: f32,
+    underruns: u32,
+    skips: u32,
+    peak: f32,
+}
+
+#[derive(serde::Serialize)]
+pub struct StatsSnapshot {
+    game: SourceSnapshot,
+    music: SourceSnapshot,
+    output_rate: u32,
+    buffer_ms: f32,
+    latency_ms: f32,
+    clipped: u32,
+}
+
+/// When the current output buffer will be heard, for timestamping beeps.
+struct Tick {
+    t0: f64,       // clock_ms() at which frame 0 of this buffer leaves the device
+    frame_ms: f64, // duration of one output frame
+    rate: u32,     // output frames per second
 }
 
 struct Fifo {
@@ -85,11 +195,51 @@ struct Reader {
     next: [f32; 2],
     frac: f64,
     gain: f32,
+    last_target: usize, // FIFO target at the previous callback, to spot delay changes
+    onset: OnsetDetector,
+}
+
+/// Beep detector for the game source while the sync probe is on.
+struct OnsetDetector {
+    floor: f32,       // running average level
+    since_loud: u32,  // output frames since the level was last above the trigger
+    since_onset: u32, // output frames since the last detected beep
+}
+
+impl OnsetDetector {
+    fn new() -> Self {
+        Self { floor: 0.0, since_loud: 0, since_onset: u32::MAX }
+    }
+
+    /// Spots the start of a beep: the level jumps well above its running average
+    /// after at least 100 ms of quiet. Fed the level before volume / mute.
+    fn feed(&mut self, a: f32, i: usize, tick: &Tick, shared: &Shared) {
+        let quiet = tick.rate / 10;
+        let refractory = tick.rate / 4;
+        let trigger = (self.floor * 8.0).max(0.03);
+        if a > trigger {
+            if self.since_loud >= quiet && self.since_onset >= refractory {
+                self.since_onset = 0;
+                let t = tick.t0 + i as f64 * tick.frame_ms;
+                if let Ok(mut v) = shared.probe.onsets.try_lock() {
+                    if v.len() < 256 {
+                        v.push(t);
+                    }
+                }
+            }
+            self.since_loud = 0;
+        } else {
+            self.since_loud = self.since_loud.saturating_add(1);
+        }
+        self.since_onset = self.since_onset.saturating_add(1);
+        self.floor += (a - self.floor) * 0.0005;
+    }
 }
 
 impl Reader {
     /// Adds this source's audio for `frames` output frames into `mix`.
-    fn mix_into(&mut self, mix: &mut [[f32; 2]], shared: &Shared) {
+    fn mix_into(&mut self, mix: &mut [[f32; 2]], shared: &Shared, tick: &Tick) {
+        let stats = shared.stats(self.channel);
         let target_gain = shared.level(self.channel).gain();
         let base = match self.channel {
             Channel::Game => GAME_BASE_MS + shared.delay_ms.load(Ordering::Relaxed),
@@ -97,27 +247,48 @@ impl Reader {
         };
         let target = (self.rate * base / 1000) as usize;
         let slack = (self.rate * SLACK_MS / 1000) as usize;
+        stats.target.store(target as u32, Ordering::Relaxed);
 
         let Ok(mut f) = self.fifo.lock() else { return };
-        let avail = f.buf.len() / 2;
+        let mut avail = f.buf.len() / 2;
+        if target != self.last_target {
+            // The delay changed: move to the new latency now. Left alone, the fill
+            // level would only follow on the next underrun (longer delay) or once
+            // it overshot by more than the slack (shorter delay).
+            self.last_target = target;
+            if avail > target {
+                f.buf.drain(..(avail - target) * 2);
+                avail = target;
+            } else {
+                f.primed = false; // build up the extra delay with silence
+            }
+        }
         if !f.primed {
             if avail >= target {
                 f.primed = true;
             } else {
+                stats.fill.store(avail as u32, Ordering::Relaxed);
                 return; // silence until the cushion has built up
             }
         }
         if avail > target + slack {
             let drop = (avail - target) * 2;
             f.buf.drain(..drop);
+            avail = target;
+            stats.skips.fetch_add(1, Ordering::Relaxed);
         }
+        stats.fill.store(avail as u32, Ordering::Relaxed);
 
-        for out in mix.iter_mut() {
+        let probe = self.channel == Channel::Game && shared.probe.on.load(Ordering::Relaxed);
+        let mut peak = 0.0f32;
+        let mut ran_dry = false;
+        for (i, out) in mix.iter_mut().enumerate() {
             while self.frac >= 1.0 {
                 self.prev = self.next;
                 match (f.buf.pop_front(), f.buf.pop_front()) {
                     (Some(l), Some(r)) => self.next = [l, r],
                     _ => {
+                        ran_dry |= f.primed;
                         f.primed = false; // ran dry: re-prime
                         self.next = [0.0, 0.0];
                     }
@@ -131,7 +302,16 @@ impl Reader {
             self.gain += (target_gain - self.gain) * 0.002; // ~10ms smoothing, avoids clicks
             out[0] += l * self.gain;
             out[1] += r * self.gain;
+            let a = l.abs().max(r.abs());
+            peak = peak.max(a);
+            if probe {
+                self.onset.feed(a, i, tick, shared);
+            }
         }
+        if ran_dry {
+            stats.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+        stats.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -177,11 +357,7 @@ pub fn list_devices() -> DeviceList {
 
 impl AudioEngine {
     pub fn new(on_error: ErrorSink) -> Self {
-        let shared = Arc::new(Shared {
-            game: Level::new(0.8),
-            music: Level::new(0.5),
-            delay_ms: AtomicU32::new(0),
-        });
+        let shared = Arc::new(Shared::new());
         let (tx, rx) = channel::<Cmd>();
         let sh = shared.clone();
         // cpal streams stay on the thread that owns them; this thread holds them.
@@ -229,6 +405,39 @@ impl AudioEngine {
     pub fn set_delay(&self, ms: u32) {
         self.shared.delay_ms.store(ms.min(1000), Ordering::Relaxed);
     }
+
+    /// Numbers for the stats overlay. Peaks and the clip count cover the time
+    /// since the previous call.
+    pub fn stats(&self) -> StatsSnapshot {
+        let o = &self.shared.out;
+        let rate = o.rate.load(Ordering::Relaxed);
+        StatsSnapshot {
+            game: self.shared.game_stats.snapshot(),
+            music: self.shared.music_stats.snapshot(),
+            output_rate: rate,
+            buffer_ms: o.buffer.load(Ordering::Relaxed) as f32 * 1000.0 / rate.max(1) as f32,
+            latency_ms: o.latency_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            clipped: o.clipped.swap(0, Ordering::Relaxed),
+        }
+    }
+
+    /// Milliseconds on the engine's monotonic clock (the clock beep onsets use).
+    pub fn clock_ms(&self) -> f64 {
+        self.shared.now_ms()
+    }
+
+    /// Starts or stops beep detection on the game source. Clears old onsets.
+    pub fn sync_probe(&self, on: bool) {
+        if let Ok(mut v) = self.shared.probe.onsets.lock() {
+            v.clear();
+        }
+        self.shared.probe.on.store(on, Ordering::Relaxed);
+    }
+
+    /// Beep onsets detected since the last call, in `clock_ms` time.
+    pub fn sync_onsets(&self) -> Vec<f64> {
+        self.shared.probe.onsets.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+    }
 }
 
 fn find(devices: impl Iterator<Item = cpal::Device>, name: &str) -> Option<cpal::Device> {
@@ -242,6 +451,10 @@ fn build(
     shared: Arc<Shared>,
     on_error: ErrorSink,
 ) -> Result<(Vec<cpal::Stream>, String), String> {
+    for c in [Channel::Game, Channel::Music] {
+        shared.stats(c).reset();
+    }
+    shared.out.rate.store(0, Ordering::Relaxed);
     if game_name.is_none() && music_name.is_none() {
         return Ok((Vec::new(), "Audio off".into()));
     }
@@ -269,6 +482,7 @@ fn build(
         let sup = dev.default_input_config().map_err(|e| e.to_string())?;
         let (s, r) = open_source(&dev, sup, Channel::Game, on_error.clone())?;
         parts.push(format!("game {} Hz", r.rate));
+        mark_active(&shared, &r);
         streams.push(s);
         readers.push(r);
     }
@@ -294,6 +508,7 @@ fn build(
             .map_err(|e| e.to_string())?;
         let (s, r) = open_source(&dev, sup, Channel::Music, on_error.clone())?;
         parts.push(format!("music {} Hz", r.rate));
+        mark_active(&shared, &r);
         streams.push(s);
         readers.push(r);
     }
@@ -339,6 +554,12 @@ fn take(v: &mut Vec<Reader>) -> Vec<Reader> {
     std::mem::take(v)
 }
 
+fn mark_active(shared: &Shared, r: &Reader) {
+    let s = shared.stats(r.channel);
+    s.rate.store(r.rate, Ordering::Relaxed);
+    s.active.store(true, Ordering::Relaxed);
+}
+
 fn open_source(
     dev: &cpal::Device,
     sup: cpal::SupportedStreamConfig,
@@ -370,6 +591,8 @@ fn open_source(
         next: [0.0; 2],
         frac: 0.0,
         gain: 0.0,
+        last_target: 0,
+        onset: OnsetDetector::new(),
     };
     Ok((stream, reader))
 }
@@ -418,8 +641,9 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let ch = cfg.channels.max(1) as usize;
+    let out_rate = cfg.sample_rate;
     for r in &mut readers {
-        r.step = r.rate as f64 / cfg.sample_rate as f64;
+        r.step = r.rate as f64 / out_rate as f64;
         r.gain = shared.level(r.channel).gain();
     }
     // The closure needs to own the readers, but we must be able to return them
@@ -430,14 +654,28 @@ where
 
     let res = dev.build_output_stream::<T, _, _>(
         cfg.clone(),
-        move |out: &mut [T], _| {
+        move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
             let frames = out.len() / ch;
+            let ts = info.timestamp();
+            let latency = ts.playback.duration_since(ts.callback);
+            let tick = Tick {
+                t0: shared.now_ms() + latency.as_secs_f64() * 1000.0,
+                frame_ms: 1000.0 / out_rate as f64,
+                rate: out_rate,
+            };
+            shared.out.rate.store(out_rate, Ordering::Relaxed);
+            shared.out.buffer.store(frames as u32, Ordering::Relaxed);
+            shared.out.latency_us.store(latency.as_micros().min(u32::MAX as u128) as u32, Ordering::Relaxed);
             mix.clear();
             mix.resize(frames, [0.0; 2]);
             if let Ok(mut readers) = rs.lock() {
                 for r in readers.iter_mut() {
-                    r.mix_into(&mut mix, &shared);
+                    r.mix_into(&mut mix, &shared, &tick);
                 }
+            }
+            let clipped = mix.iter().flatten().filter(|s| s.abs() > 1.0).count() as u32;
+            if clipped > 0 {
+                shared.out.clipped.fetch_add(clipped, Ordering::Relaxed);
             }
             for (frame, m) in out.chunks_exact_mut(ch).zip(&mix) {
                 let (l, r) = (m[0].clamp(-1.0, 1.0), m[1].clamp(-1.0, 1.0));
@@ -469,6 +707,102 @@ mod tests {
         let d = super::list_devices();
         println!("inputs: {:?}\noutputs: {:?}\ndefault: {:?}", d.inputs, d.outputs, d.default_output);
         assert!(!d.outputs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+    const BLOCK: usize = 480; // 10 ms callbacks
+
+    fn reader(fifo: &Arc<Mutex<Fifo>>) -> Reader {
+        Reader {
+            channel: Channel::Game,
+            fifo: fifo.clone(),
+            rate: RATE,
+            step: 1.0,
+            prev: [0.0; 2],
+            next: [0.0; 2],
+            frac: 0.0,
+            gain: 1.0,
+            last_target: 0,
+            onset: OnsetDetector::new(),
+        }
+    }
+
+    fn tick(n: usize) -> Tick {
+        Tick { t0: n as f64 * 10.0, frame_ms: 1000.0 / RATE as f64, rate: RATE }
+    }
+
+    /// Runs `blocks` 10 ms callbacks: push one block of input (from `signal`), pull one block out.
+    fn run(r: &mut Reader, fifo: &Arc<Mutex<Fifo>>, shared: &Shared, start: usize, blocks: usize, signal: impl Fn(usize) -> f32) {
+        let mut mix = vec![[0.0f32; 2]; BLOCK];
+        for n in start..start + blocks {
+            {
+                let mut f = fifo.lock().unwrap();
+                for i in 0..BLOCK {
+                    let v = signal(n * BLOCK + i);
+                    f.buf.push_back(v);
+                    f.buf.push_back(v);
+                }
+            }
+            mix.iter_mut().for_each(|m| *m = [0.0; 2]);
+            r.mix_into(&mut mix, shared, &tick(n));
+        }
+    }
+
+    fn fill_ms(shared: &Shared) -> f32 {
+        shared.game_stats.fill.load(Ordering::Relaxed) as f32 * 1000.0 / RATE as f32
+    }
+
+    fn new_fifo() -> Arc<Mutex<Fifo>> {
+        Arc::new(Mutex::new(Fifo { buf: VecDeque::new(), primed: false }))
+    }
+
+    #[test]
+    fn delay_changes_take_effect_immediately() {
+        let shared = Shared::new();
+        let fifo = new_fifo();
+        let mut r = reader(&fifo);
+        // Prime with a little extra input so the FIFO sits at its 15 ms base.
+        fifo.lock().unwrap().buf.extend(std::iter::repeat_n(0.0, 2 * 720));
+        run(&mut r, &fifo, &shared, 0, 50, |_| 0.1);
+        assert!((fill_ms(&shared) - 15.0).abs() < 1.0, "base fill {}", fill_ms(&shared));
+
+        // Longer delay: re-primes with silence, then holds the new level.
+        shared.delay_ms.store(100, Ordering::Relaxed);
+        run(&mut r, &fifo, &shared, 50, 50, |_| 0.1);
+        assert!((fill_ms(&shared) - 115.0).abs() < 11.0, "after +100 ms: {}", fill_ms(&shared));
+
+        // Shorter delay by less than the slack: trimmed at once, not left at 115 ms.
+        shared.delay_ms.store(70, Ordering::Relaxed);
+        run(&mut r, &fifo, &shared, 100, 5, |_| 0.1);
+        assert!((fill_ms(&shared) - 85.0).abs() < 11.0, "after -30 ms: {}", fill_ms(&shared));
+    }
+
+    #[test]
+    fn detects_beep_onsets() {
+        let shared = Shared::new();
+        shared.probe.on.store(true, Ordering::Relaxed);
+        let fifo = new_fifo();
+        let mut r = reader(&fifo);
+        // 1 kHz beeps of 100 ms, once a second starting at 0.5 s, over a little noise.
+        let beep = |i: usize| {
+            let t = i as f32 / RATE as f32;
+            let noise = ((i * 7919) % 101) as f32 / 101.0 * 0.004 - 0.002;
+            let in_beep = t >= 0.5 && (t - 0.5) % 1.0 < 0.1;
+            noise + if in_beep { 0.5 * (t * 1000.0 * std::f32::consts::TAU).sin() } else { 0.0 }
+        };
+        run(&mut r, &fifo, &shared, 0, 350, beep);
+        let onsets = shared.probe.onsets.lock().unwrap().clone();
+        assert_eq!(onsets.len(), 3, "onsets {onsets:?}");
+        // Heard 15 ms after input (the FIFO's base latency), plus up to one block of priming.
+        for (k, t) in onsets.iter().enumerate() {
+            let expected = 500.0 + 1000.0 * k as f64 + 15.0;
+            assert!((t - expected).abs() < 12.0, "onset {k} at {t}, expected ~{expected}");
+        }
     }
 }
 

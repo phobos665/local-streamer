@@ -8,10 +8,11 @@
 </head>
 <body>
   <video id="video" autoplay muted playsinline disablepictureinpicture></video>
-  <canvas id="fsr" hidden></canvas>
+  <canvas id="canvas" hidden></canvas>
 
   <div id="message" hidden></div>
   <div id="osd" hidden></div>
+  <pre id="stats" hidden></pre>
 
   <button id="gear" class="chrome" title="Settings (right-click or Ctrl+H)" aria-label="Settings">
     <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L15 3.5h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L6.6 11a7.5 7.5 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2.1-1.6ZM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" transform="translate(-1 0)"/></svg>
@@ -48,6 +49,8 @@
       <label>Scaling
         <select id="scaling">
           <option value="off">Standard (smooth)</option>
+          <option value="sharp">Sharp pixels (nearest neighbour)</option>
+          <option value="integer">Integer scale (sharp, even lines)</option>
           <option value="fsr">AMD FSR 1 (sharper upscaling)</option>
         </select>
       </label>
@@ -57,8 +60,47 @@
           <output id="sharpnessText">80%</output>
         </div>
         <input id="sharpness" type="range" min="0" max="100" step="5" value="80" aria-label="Sharpness">
-        <p id="fsrStatus" class="hint"></p>
       </div>
+      <div id="lineMultiplierRow">
+        <label>Line multiplier
+          <select id="lineMultiplier">
+            <option value="1">None (modern console)</option>
+            <option value="2">2x</option><option value="3">3x</option><option value="4">4x</option>
+            <option value="5">5x</option><option value="6">6x</option><option value="7">7x</option>
+            <option value="8">8x</option><option value="9">9x</option><option value="10">10x</option>
+          </select>
+        </label>
+        <p class="hint">How many times your scaler repeats each line, e.g. 5 for a RetroTINK 5X in 5x mode.
+          Integer scaling then gives every source line the same number of screen pixels.
+          <em>Detect</em> below fills this in.</p>
+      </div>
+      <label>Aspect ratio
+        <select id="aspect">
+          <option value="source">As captured</option>
+          <option value="4:3">4:3 (retro consoles)</option>
+          <option value="16:9">16:9</option>
+          <option value="stretch">Stretch to window</option>
+        </select>
+      </label>
+      <div class="crop">
+        <span>Crop (pixels)</span>
+        <label>Top <input id="cropTop" type="number" min="0" step="1" value="0"></label>
+        <label>Bottom <input id="cropBottom" type="number" min="0" step="1" value="0"></label>
+        <label>Left <input id="cropLeft" type="number" min="0" step="1" value="0"></label>
+        <label>Right <input id="cropRight" type="number" min="0" step="1" value="0"></label>
+      </div>
+      <div class="row">
+        <button id="detect">Detect borders and line multiplier</button>
+        <button id="resetCrop" class="link">Reset</button>
+      </div>
+      <p class="hint">Run Detect on a bright, detailed screen. It trims black bars and spots a line multiplier.</p>
+      <div class="row">
+        <span>Overscan</span>
+        <output id="overscanText">0%</output>
+      </div>
+      <input id="overscan" type="range" min="0" max="10" step="0.5" value="0" aria-label="Overscan">
+      <p class="hint">Trims each edge a little more, to hide junk some consoles draw at the border.</p>
+      <p id="pictureStatus" class="hint"></p>
     </section>
 
     <section>
@@ -81,6 +123,11 @@
       </div>
       <input id="delay" type="range" min="0" max="500" step="10" value="0" aria-label="Audio delay">
       <p class="hint">Add delay if sound arrives before the picture.</p>
+      <button id="measureSync" class="wide">Measure A/V sync</button>
+      <p class="hint">Play a flash-and-beep test on the console (the 240p Test Suite's audio sync test,
+        or a "flash and beep" video), then press Measure. The app times about eight flashes against their
+        beeps and sets Audio delay.</p>
+      <p id="syncStatus" class="hint" aria-live="polite"></p>
     </section>
 
     <section>
@@ -122,6 +169,8 @@
     <section>
       <h2>Window</h2>
       <label class="check"><input type="checkbox" id="onTop"> Always on top</label>
+      <label class="check"><input type="checkbox" id="showStats"> Show stats <span class="os-windows">(Ctrl+I)</span><span class="os-mac">(⌃I)</span></label>
+      <p class="hint">Frame rate, dropped frames, audio buffers and clipping. Discord's share shows them too.</p>
       <button id="fullscreen"><span class="os-windows">Fullscreen (F11 / double-click)</span><span class="os-mac">Full screen (⌃⌘F / double-click)</span></button>
     </section>
   </aside>
